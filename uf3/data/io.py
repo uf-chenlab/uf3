@@ -140,6 +140,7 @@ class DataCoordinator:
                                   load=True,
                                   energy_key=None,
                                   force_key=None,
+                                   filter = False,
                                   **kwargs):
         """Wrapper for io.parse_trajectory()"""
         if prefix is None:
@@ -154,7 +155,7 @@ class DataCoordinator:
                               energy_key=energy_key,
                               force_key=force_key,
                               size_key=self.size_key,
-                              **kwargs)
+                              **kwargs, filter=filter)
 
         if energy_key != self.energy_key:
             df.rename(columns={energy_key: self.energy_key},
@@ -309,7 +310,7 @@ def parse_trajectory(fname: str,
                      atoms_key: str = "geometry",
                      energy_key: str = "energy",
                      force_key: str = 'force',
-                     size_key: str = 'size'):
+                     size_key: str = 'size', filter = False):
     """
     Wrapper for ase.io.read, which is compatible with
     many file formats (notably VASP's vasprun.xml and extended xyz).
@@ -347,11 +348,23 @@ def parse_trajectory(fname: str,
     else:  # flexible read function for a variety of filetypes
         geometries = ase_io.read(fname, index=slice(None, None))
         new_index = None
+    print(len(geometries))
     if not isinstance(geometries, list):
         geometries = [geometries]
     geometries = update_geometries_from_calc(geometries,
                                              energy_key=energy_key,
                                              force_key=force_key)
+    #for i,geom in enumerate(geometries):
+    splits = fname.split('OUTCAR')
+    path = splits[0] +'OSZICAR' + splits[1]
+    nelm = find_nelm(path)
+    geometries_filter = []
+    for nel,geom in zip(nelm,geometries):
+        if nel <= 59:
+            geometries_filter.append(geom)
+            
+    if (filter == False):
+        geometries_filter = geometries
     # create DataFrame
     default_columns = [atoms_key, energy_key, 'fx', 'fy', 'fz']
     scalar_keys = [p for p in scalar_keys
@@ -360,7 +373,7 @@ def parse_trajectory(fname: str,
                   if p not in default_columns]
     columns = default_columns + scalar_keys + array_keys
     df = pd.DataFrame(columns=columns)
-    df[atoms_key] = geometries
+    df[atoms_key] = geometries_filter
     df[energy_key] = 0.0
     # object-dataframe consistency
     scalar_keys = scalar_keys + [energy_key]
@@ -378,6 +391,20 @@ def parse_trajectory(fname: str,
         pattern = '{}_{{}}'.format(prefix)
         df = df.rename(pattern.format)
     return df
+
+def find_nelm(path):
+    """
+    Added by ACH
+    Function to get number of electronic steps from OSZICAR
+    """
+    with open(path,'r') as fp:
+        lines = fp.readlines()
+    nelm=[]
+    for i in range(len(lines)):
+        line = lines[i].split()
+        if line[3]=='E0=':
+            nelm.append(int(lines[i-1].split()[1]))
+    return nelm
 
 
 def read_database(filename: str, index: bool = None, **kwargs):

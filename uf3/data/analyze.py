@@ -186,6 +186,7 @@ class DataAnalyzer:
                                            r_min,
                                            r_max,
                                            rattle=rattle)
+                                           
         dist_ref = composition.hash_gather(dists, hashes)
         self.update_histograms(dist_ref)
 
@@ -216,21 +217,19 @@ class DataAnalyzer:
         rdf = self.histogram_values[pair] / norm / weight
         return norm, rdf
 
-    def analyze(self,
-                smooth: bool = True,
-                filter_width: int = 9,
+    def analyze(self, smooth: bool = True, filter_width: int = 9,
                 filter_degree: int = 3,
                 ) -> Dict:
         """
         Construct histogram of distances per pair interaction across
             list of geometries. Useful for optimizing the lower- and upper-
             bounds of knot sequences.
-
+    
         Args:
             smooth (bool):
             filter_width (int):
             filter_degree (int):
-
+    
         """
         reference = {}
         rdfs = {}
@@ -238,29 +237,37 @@ class DataAnalyzer:
         factors = {}
         symbol_map = {k: composition.hash_to_symbols(k)
                       for k in self.histogram_values.keys()}
-
+    
         hash_check = [isinstance(k, int) for k in self.pairs_acc.keys()]
         if any(hash_check):
             self.pairs_acc = {symbol_map[k]: v for k, v
                                in self.pairs_acc.items()}
             self.histogram_values = {symbol_map[k]: v for k, v
                                      in self.histogram_values.items()}
-
+    
         # estimate average bond lengths
         atomic_volumes, volume_soln = self.fit_element_data()
         bond_ref = {}
         for pair in self.pair_tuples:
             bond_ref[pair] = (np.mean([atomic_volumes[el] for el in pair])
                               / (4 / 3 * np.pi)) ** (1 / 3) * 2
+    
         # process pair data
         n_atoms = np.sum(self.sizes)
         volume = np.sum(self.volumes)
         for pair in self.pair_tuples:
+            if pair not in self.histogram_values:
+                print("-------------------------------------")
+                print(f"Pair {pair} does not exist in histogram_values. Skipping.")
+                print("--------------------------------------")
+                warnings.warn(f"Pair {pair} does not exist in histogram_values. Skipping.")
+                continue
+    
             hist = self.histogram_values[pair]
-            if np.sum(self.histogram_values[pair]) == 0:
+            if np.sum(hist) == 0:
                 warnings.warn(f"No observed {pair} pairs.")
                 continue
-
+    
             norm, rdf = self.normalize_pair_histogram(pair, n_atoms, volume)
             rdfs[pair] = rdf
             reference[pair] = norm
@@ -277,6 +284,7 @@ class DataAnalyzer:
             suggest_cutoffs(self.lower_bounds[pair],
                             self.valleys[pair],
                             bond_ref[pair])
+    
         analysis = dict(histograms=self.histogram_values,
                         bin_edges=self.bin_edges,
                         reference=reference,
@@ -289,6 +297,7 @@ class DataAnalyzer:
                         atomic_volumes=atomic_volumes,
                         )
         return analysis
+
 
     def fit_element_data(self):
         """

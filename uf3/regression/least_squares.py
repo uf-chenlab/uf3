@@ -1,8 +1,3 @@
-"""
-This module provides the WeightedLinearModel class for fitting UF potentials
-from featurized DataFrames using regularized least squares.
-"""
-
 from typing import List, Dict, Collection, Tuple
 import os
 import warnings
@@ -14,6 +9,8 @@ from uf3.data import io
 from uf3.data import composition
 from uf3.util import json_io
 from uf3.util import parallel
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
 
 
 class VarianceRecorder:
@@ -22,13 +19,30 @@ class VarianceRecorder:
         self.mean = mean
         self.std = std
         self.n = int(n)
-
+    def update_manual(self, mean, std, n):
+        if self.n == 0:
+            self.mean = mean
+            self.std = std
+            self.n = n
+            return self.mean, self.std, self.n
+        else:
+            batch_std = std
+            batch_mean = mean
+            m = float(self.n)
+            n = n
+            std = (m / (m + n) * self.std**2
+                   + n / (m + n) * batch_std**2
+                   + m * n / (m + n)**2 * (self.mean - batch_mean)**2)
+            self.std = np.sqrt(std)
+            self.mean = m / (m + n) * self.mean + n / (m + n) * batch_mean
+            self.n += n
+            return self.mean, self.std, self.n
     def update(self, batch: Collection) -> Tuple:
         """
         Args:
             batch (list or np.ndarray): n-dimensional data. For speed purposes,
                 dimensions are not checked for compatibility so caution
-                is advised when working with multidimensional data.
+                is advised when working with multidimensional data.f
                 Statistics are computed along the first axis.
 
         Returns:
@@ -168,6 +182,12 @@ class WeightedLinearModel(BasicLinearModel):
         if self.regularizer is None:
             # initialize regularizer matrix if unspecified.
             self.set_params(**params)
+        self._acc_gram_e = None
+        self._acc_gram_f = None
+        self._acc_ord_e = None
+        self._acc_ord_f = None
+        self._acc_e_variance = VarianceRecorder()
+        self._acc_f_variance = VarianceRecorder()
 
     def set_params(self, **params):
         """Set parameters from keyword arguments. Initializes
@@ -351,6 +371,117 @@ class WeightedLinearModel(BasicLinearModel):
         ordinate = ((weight * energy_weight**2 * ord_e)
                     + ((1 - weight) * force_weight**2 * ord_f))
         return gram, ordinate
+   
+    @staticmethod
+    def process_table(j, table_names, filename, subset, batch_size, sample_weights, energy_key, model_instance):
+        """
+        Helper function to process a single table in parallel.
+        """
+        table_name = table_names[j]
+        df = process.load_feature_db(filename, table_name)
+        keys = df.index.unique(level=0).intersection(subset)
+    
+        if len(keys) == 0:
+            # Skip tables with no keys in the subset
+            return None
+    
+        # Local VarianceRecorder for energy and force
+        local_e_variance = VarianceRecorder()
+        local_f_variance = VarianceRecorder()
+    
+        # Compute gram matrices and ordinates
+        intermediates = model_instance.gram_from_df(
+            df, keys,
+            e_variance=local_e_variance,
+            f_variance=local_f_variance,
+            sample_weights=sample_weights,
+            energy_key=energy_key,
+            batch_size=batch_size
+        )
+        return (*intermediates, local_e_variance, local_f_variance)
+    def fit_from_file_parallel(self,
+                           filename: str,
+                           subset: Collection,
+                           weight: float = 0.5,
+                           batch_size=2500,
+                           sample_weights: Dict = None,
+                           energy_key="energy",
+                           num_cores=1,
+                           progress: str = "bar"):
+        """
+        Parallelized version of fit_from_file with a progress bar.
+        """
+        if not os.path.isfile(filename):
+            raise FileNotFoundError(filename)
+    
+        # Analyze the HDF5 file
+        n_tables, _, table_names, _ = io.analyze_hdf_tables(filename)
+        gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
+    
+        # Prepare progress bar
+        with ThreadPoolExecutor(max_workers=num_cores) as executor:
+            # Use tqdm to show progress
+            with tqdm(total=n_tables, desc="Processing Tables", unit="table") as pbar:
+                # Wrapper function for updating progress
+                def track_progress(result):
+                    pbar.update()
+    
+                # Submit tasks with callback for updating the progress bar
+                futures = [
+                    executor.submit(
+                        WeightedLinearModel.process_table,
+                        j,
+                        table_names,
+                        filename,
+                        subset,
+                        batch_size,
+                        sample_weights,
+                        energy_key,
+                        self
+                    ) for j in range(n_tables)
+                ]
+    
+                results = []
+                for future in futures:
+                    # Wait for the task to finish and append the result
+                    result = future.result()
+                    results.append(result)
+                    track_progress(result)
+    
+        # Aggregate results
+        e_means, e_stds, e_ns = [], [], []
+        f_means, f_stds, f_ns = [], [], []
+    
+        for result in results:
+            if result is not None:
+                g_e, g_f, o_e, o_f, local_e_variance, local_f_variance = result
+                gram_e += g_e
+                gram_f += g_f
+                ord_e += o_e
+                ord_f += o_f
+                e_means.append((local_e_variance.mean, local_e_variance.std, local_e_variance.n))
+                f_means.append((local_f_variance.mean, local_f_variance.std, local_f_variance.n))
+    
+        # Combine variances from all tables
+        def combine_variances(variance_list):
+            combined = VarianceRecorder()
+            for mean, std, n in variance_list:
+                if n > 0:  # Ensure there are valid samples
+                    # Update the combined variance recorder directly
+                    combined.update_manual(mean, std, n)  # Use update() instead of update_with_components
+            return combined
+    
+        e_variance = combine_variances(e_means)
+        f_variance = combine_variances(f_means)
+    
+        # Compute weights
+        energy_weight, force_weight = calc_E_F_weights(e_variance.n, f_variance.n, e_variance.std, f_variance.std)
+        # Combine gram matrices and fit
+        gram, ordinate = self.combine_weighted_gram(
+            gram_e, gram_f, ord_e, ord_f,
+            energy_weight, force_weight, weight
+        )
+        self.fit_with_gram(gram, ordinate)
 
     def fit_from_file(self,
                       filename: str,
@@ -422,7 +553,174 @@ class WeightedLinearModel(BasicLinearModel):
                                                     force_weight,
                                                     weight)
         self.fit_with_gram(gram, ordinate)
+        
+    def fit_from_files(self,
+                      filenames: List,
+                      subset: Collection,
+                      weight: float = 0.5,
+                      batch_size=2500,
+                      sample_weights: Dict = None,
+                      energy_key="energy",
+                      progress: str = "bar"):
+        """
+        Accumulate inputs and outputs from batched parsing of HDF5 file
+        and compute direct solution via LU decomposition.
+        Args:
+            filename (list): List of paths to HDF5 file.
+            subset (list): list of keys for training.
+            weight (float): parameter balancing contribution from energies
+                vs. forces. Higher values favor energies; defaults to 0.5.
+            batch_size (int): batch size, in rows, for matrix multiplication
+                operations in constructing gram matrices.
+            sample_weights (dict):
+            energy_key (str): column name for energies, default "energy".
+            progress (str): style for progress indicators.
+        """
+        n_tables = 0
+        table_names = []
+        filenames_list = []
+        for filename in filenames:
+            if not os.path.isfile(filename):
+                raise FileNotFoundError(filename)
+            n_table, _, table_name, _ = io.analyze_hdf_tables(filename)
+            n_tables = n_tables + n_table
+            table_names = table_names + table_name
+            filenames_list = filenames_list + [filename for _ in table_name]
+        gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
+        e_variance = VarianceRecorder()
+        f_variance = VarianceRecorder()
+        table_iterator = parallel.progress_iter(np.arange(n_tables),
+                                                style=progress)
+        for j in table_iterator:
+            table_name = table_names[j]
+            df = process.load_feature_db(filenames_list[j], table_name)
+            keys = df.index.unique(level=0).intersection(subset)
+            if len(keys) == 0:
+                continue
+            intermediates = self.gram_from_df(df,
+                                              keys,
+                                              e_variance=e_variance,
+                                              f_variance=f_variance,
+                                              sample_weights=sample_weights,
+                                              energy_key=energy_key,
+                                              batch_size=batch_size)
+            g_e, g_f, o_e, o_f = intermediates
 
+            gram_e += g_e
+            gram_f += g_f
+            ord_e += o_e
+            ord_f += o_f
+        energy_weight, force_weight = calc_E_F_weights(e_variance.n,
+                                                       f_variance.n,
+                                                       e_variance.std,
+                                                       f_variance.std)
+        gram, ordinate = self.combine_weighted_gram(gram_e,
+                                                    gram_f,
+                                                    ord_e,
+                                                    ord_f,
+                                                    energy_weight,
+                                                    force_weight,
+                                                    weight)
+        self.fit_with_gram(gram, ordinate)
+    def fit_from_files_parallel(self,
+                      filenames: List,
+                      subset: Collection,
+                      weight: float = 0.5,
+                      batch_size=2500,
+                      sample_weights: Dict = None,
+                      energy_key="energy",
+                      num_cores=1,
+                      progress: str = "bar"):
+        """
+        Accumulate inputs and outputs from batched parsing of HDF5 file
+        and compute direct solution via LU decomposition.
+        Args:
+            filename (list): List of paths to HDF5 file.
+            subset (list): list of keys for training.
+            weight (float): parameter balancing contribution from energies
+                vs. forces. Higher values favor energies; defaults to 0.5.
+            batch_size (int): batch size, in rows, for matrix multiplication
+                operations in constructing gram matrices.
+            sample_weights (dict):
+            energy_key (str): column name for energies, default "energy".
+            progress (str): style for progress indicators.
+        """
+        n_tables = 0
+        table_names = []
+        filenames_list = []
+        for filename in filenames:
+            if not os.path.isfile(filename):
+                raise FileNotFoundError(filename)
+            n_table, _, table_name, _ = io.analyze_hdf_tables(filename)
+            n_tables = n_tables + n_table
+            table_names = table_names + table_name
+            filenames_list = filenames_list + [filename for _ in table_name]
+        gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
+    
+        # Prepare progress bar
+        with ThreadPoolExecutor(max_workers=num_cores) as executor:
+            # Use tqdm to show progress
+            with tqdm(total=n_tables, desc="Processing Tables", unit="table") as pbar:
+                # Wrapper function for updating progress
+                def track_progress(result):
+                    pbar.update()
+    
+                # Submit tasks with callback for updating the progress bar
+                futures = [
+                    executor.submit(
+                        WeightedLinearModel.process_table,
+                        j,
+                        table_names,
+                        filenames_list[j],
+                        subset,
+                        batch_size,
+                        sample_weights,
+                        energy_key,
+                        self
+                    ) for j in range(n_tables)
+                ]
+    
+                results = []
+                for future in futures:
+                    # Wait for the task to finish and append the result
+                    result = future.result()
+                    results.append(result)
+                    track_progress(result)
+    
+        # Aggregate results
+        e_means, e_stds, e_ns = [], [], []
+        f_means, f_stds, f_ns = [], [], []
+    
+        for result in results:
+            if result is not None:
+                g_e, g_f, o_e, o_f, local_e_variance, local_f_variance = result
+                gram_e += g_e
+                gram_f += g_f
+                ord_e += o_e
+                ord_f += o_f
+                e_means.append((local_e_variance.mean, local_e_variance.std, local_e_variance.n))
+                f_means.append((local_f_variance.mean, local_f_variance.std, local_f_variance.n))
+    
+        # Combine variances from all tables
+        def combine_variances(variance_list):
+            combined = VarianceRecorder()
+            for mean, std, n in variance_list:
+                if n > 0:  # Ensure there are valid samples
+                    # Update the combined variance recorder directly
+                    combined.update_manual(mean, std, n)  # Use update() instead of update_with_components
+            return combined
+    
+        e_variance = combine_variances(e_means)
+        f_variance = combine_variances(f_means)
+    
+        # Compute weights
+        energy_weight, force_weight = calc_E_F_weights(e_variance.n, f_variance.n, e_variance.std, f_variance.std)
+        # Combine gram matrices and fit
+        gram, ordinate = self.combine_weighted_gram(
+            gram_e, gram_f, ord_e, ord_f,
+            energy_weight, force_weight, weight
+        )
+        self.fit_with_gram(gram, ordinate)
     def initialize_gram_ordinate(self):
         """Initialize empty matrices for gram matrices and ordinates."""
         n_columns = self.n_feats - len(self.col_idx)
@@ -510,7 +808,7 @@ class WeightedLinearModel(BasicLinearModel):
                 features of the intended cutoffs. Use with Caution.
         """
         n_elements = len(self.bspline_config.element_list)
-        y_e, p_e, y_f, p_f = batched_prediction(self,
+        y_e, p_e, y_f, p_f, ids, force_ids = batched_prediction(self,
                                                 filename,
                                                 table_names=table_names,
                                                 subset_keys=keys,
@@ -521,7 +819,50 @@ class WeightedLinearModel(BasicLinearModel):
             rmse_f = rmse_metric(y_f, p_f)
             print(f"RMSE (energy): {rmse_e:.3F}")
             print(f"RMSE (forces): {rmse_f:.3F}")
-            return y_e, p_e, y_f, p_f, rmse_e, rmse_f
+            return y_e, p_e, y_f, p_f, rmse_e, rmse_f, ids, force_ids
+        else:
+            return y_e, p_e, y_f, p_f, ids
+    
+    def batched_predict_multiple_files(self,
+                        filenames: [],
+                        keys: List[str] = None,
+                        table_names: List[str] = None,
+                        score: bool = True,
+                        drop_columns: List[str] = None):
+        """
+        Extract inputs and outputs from HDF5 file and predict energies/forces.
+
+        Args:
+            filename: path to HDF5 file.
+            keys (list): keys to query from df (e.g. training subset).
+            table_names (list): list of table names in HDF5 to read.
+            score (bool): whether to return root mean square error metrics.
+
+        Returns:
+            y_e (np.ndarray): target values for energies.
+            p_e (np.ndarray): prediction values for energies.
+            y_f (np.ndarray): target values for forces.
+            p_f (np.ndarray): prediction values for forces.
+            rmse_e (np.ndarray): RMSE across energy predictions.
+            rmse_e (np.ndarray): RMSE across force predictions.
+            drop_columns (list): list of columns to drop. Used when modifying
+                the cutoffs of the feature vectors from HDF5 file. No internal
+                checks are performed to see if dropping provided columns produce
+                features of the intended cutoffs. Use with Caution.
+        """
+        n_elements = len(self.bspline_config.element_list)
+        y_e, p_e, y_f, p_f, ids, force_labels = batched_prediction_multiple_files(self,
+                                                filenames,
+                                                table_names=table_names,
+                                                subset_keys=keys,
+                                                n_elements=n_elements,
+                                                drop_columns=drop_columns)
+        if score:
+            rmse_e = rmse_metric(y_e, p_e)
+            rmse_f = rmse_metric(y_f, p_f)
+            print(f"RMSE (energy): {rmse_e:.3F}")
+            print(f"RMSE (forces): {rmse_f:.3F}")
+            return y_e, p_e, y_f, p_f, rmse_e, rmse_f, ids, force_labels
         else:
             return y_e, p_e, y_f, p_f
 
@@ -645,6 +986,89 @@ class WeightedLinearModel(BasicLinearModel):
                                             min_curvature=min_curvature)
         print(f"{pair} Correction: adjusted {len(idx_fix)} coefficients.")
         self.coefficients[idx_subset[idx_fix]] = c_new
+    def initialize_accumulators(self):
+        """
+        Initialize the internal accumulators for incremental / fine-tuning fits.
+        After calling this, you can call accumulate_gram_from_file multiple times
+        and then finalize_fit_from_accumulator() to solve with all data.
+        """
+        self._acc_gram_e, self._acc_gram_f, self._acc_ord_e, self._acc_ord_f = \
+            self.initialize_gram_ordinate()
+        self._acc_e_variance = VarianceRecorder()
+        self._acc_f_variance = VarianceRecorder()
+
+    def accumulate_gram_from_file(self,
+                                  filename: str,
+                                  subset: Collection,
+                                  batch_size=2500,
+                                  sample_weights: Dict = None,
+                                  energy_key="energy"):
+        """
+        Read partial Gram from an HDF5 file, accumulate into the internal
+        increment/fine-tuning accumulators (self._acc_gram_e, etc.).
+        Does NOT solve yet. Call finalize_fit_from_accumulator() to solve.
+        """
+        if self._acc_gram_e is None:
+            # if we forgot to init, do it automatically
+            self.initialize_accumulators()
+
+        # Summation approach
+        if not os.path.isfile(filename):
+            raise FileNotFoundError(filename)
+
+        n_tables, _, table_names, _ = io.analyze_hdf_tables(filename)
+        for j in range(n_tables):
+            table_name = table_names[j]
+            df = process.load_feature_db(filename, table_name)
+            keys = df.index.unique(level=0).intersection(subset)
+            if len(keys) == 0:
+                continue
+            # local (per-table)
+            local_e_var = VarianceRecorder()
+            local_f_var = VarianceRecorder()
+
+            g_e, g_f, o_e, o_f = self.gram_from_df(
+                df, keys,
+                e_variance=local_e_var,
+                f_variance=local_f_var,
+                sample_weights=sample_weights,
+                energy_key=energy_key,
+                batch_size=batch_size
+            )
+            # accumulate
+            self._acc_gram_e += g_e
+            self._acc_gram_f += g_f
+            self._acc_ord_e += o_e
+            self._acc_ord_f += o_f
+            # also accumulate variances
+            self._acc_e_variance.update_manual(
+                local_e_var.mean, local_e_var.std, local_e_var.n)
+            self._acc_f_variance.update_manual(
+                local_f_var.mean, local_f_var.std, local_f_var.n)
+
+    def finalize_fit_from_accumulator(self, weight: float = 0.5):
+        """
+        Once you have accumulated Gram & Ord from multiple data sources
+        (via accumulate_gram_from_file), call this to do the final solve.
+        """
+        if self._acc_gram_e is None:
+            raise ValueError("No accumulators initialized. Call "
+                             "initialize_accumulators() or "
+                             "accumulate_gram_from_file() first.")
+
+        # Compute overall weighting
+        e_var = self._acc_e_variance
+        f_var = self._acc_f_variance
+        energy_weight, force_weight = calc_E_F_weights(
+            e_var.n, f_var.n, e_var.std, f_var.std
+        )
+
+        gram, ordinate = self.combine_weighted_gram(
+            self._acc_gram_e, self._acc_gram_f,
+            self._acc_ord_e, self._acc_ord_f,
+            energy_weight, force_weight, weight
+        )
+        self.fit_with_gram(gram, ordinate)
 
 
 def get_spline_taylor_expansion(r_target,
@@ -662,6 +1086,55 @@ def get_spline_taylor_expansion(r_target,
     y = y_trace + (d1_trace * dr) + (0.5 * d2_trace * dr ** 2)
     return y
 
+def dataframe_to_tuples_with_names(df_features,
+                        n_elements=None,
+                        energy_key='energy',
+                        sample_weights=None):
+    """
+    Extract energy/force inputs/outputs from DataFrame.
+
+    Args:
+        df_features (pd.DataFrame): dataframe with target vector (y) as the
+            first column and feature vectors (x) as remaining columns.
+        n_elements (int): number of leading columns to consider for size
+            normalization.
+        energy_key (str): key for energy samples, used to slice df_features
+            into energies and forces for weight generation.
+        sample_weights (dict):
+
+    Returns:
+        x (np.ndarray): features for machine learning.
+        y (np.ndarray): target vector.
+        w (np.ndarray): weight vector for machine learning.
+    """
+    names = df_features.index.get_level_values(0)
+    y_index = df_features.index.get_level_values(-1)
+    energy_mask = (y_index == energy_key)
+    force_mask = np.logical_not(energy_mask)
+    data = df_features.to_numpy()
+    y = data[:, 0]
+    x = data[:, 1:]
+    y_e = y[energy_mask]
+    y_f = y[force_mask]
+    #test_names = df_features.index[force_mask]
+    level_0_names = df_features.index[force_mask].get_level_values(0)
+    #level_1_values = test_names.get_level_values(1) #force components 
+    if n_elements is not None:
+        s = np.sum(x[energy_mask, :n_elements], axis=1)
+        x_e = np.divide(x[energy_mask].T, s).T
+        y_e = y_e / s
+    else:
+        x_e = x[energy_mask]
+    x_f = x[force_mask]
+    if sample_weights is not None:
+        w = np.array([sample_weights.get(name, 1.0) for name in names])
+        w_e = w[energy_mask]
+        w_f = w[force_mask]
+        x_e = np.multiply(x_e.T, w_e).T
+        y_e = np.multiply(y_e, w_e)
+        x_f = np.multiply(x_f.T, w_f).T
+        y_f = np.multiply(y_f, w_f)
+    return x_e, y_e, x_f, y_f, level_0_names
 
 def dataframe_to_tuples(df_features,
                         n_elements=None,
@@ -693,7 +1166,6 @@ def dataframe_to_tuples(df_features,
     x = data[:, 1:]
     y_e = y[energy_mask]
     y_f = y[force_mask]
-
     if n_elements is not None:
         s = np.sum(x[energy_mask, :n_elements], axis=1)
         x_e = np.divide(x[energy_mask].T, s).T
@@ -701,7 +1173,6 @@ def dataframe_to_tuples(df_features,
     else:
         x_e = x[energy_mask]
     x_f = x[force_mask]
-
     if sample_weights is not None:
         w = np.array([sample_weights.get(name, 1.0) for name in names])
         w_e = w[energy_mask]
@@ -933,53 +1404,65 @@ def validate_regularizer(regularizer: np.ndarray, n_feats: int):
 def subset_prediction(df: pd.DataFrame,
                       model: WeightedLinearModel,
                       subset_keys: Collection = None,
-                      **kwargs
-                      ) -> Tuple:
+                      **kwargs) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list, list]:
     """
-    Convenience function for optimization workflow. Read inputs/outputs
-    from DataFrame and predict using fitted model.
+    Extract inputs/outputs from a subset of a DataFrame and make predictions.
 
     Args:
-        df (pd.DataFrame): DataFrame of inputs/outputs.
-        model (WeightedLinearModel): fitted model.
-        subset_keys (list): list of keys to query from DataFrame.
+        df (pd.DataFrame): DataFrame containing input features and target values.
+        model (WeightedLinearModel): Fitted model to generate predictions.
+        subset_keys (list or set, optional): Keys to filter the DataFrame.
 
     Returns:
-        y_e (np.ndarray): target values for energies.
-        p_e (np.ndarray): prediction values for energies.
-        y_f (np.ndarray): target values for forces.
-        p_f (np.ndarray): prediction values for forces.
+        y_e (np.ndarray): Target values for energies.
+        p_e (np.ndarray): Predicted values for energies.
+        y_f (np.ndarray): Target values for forces.
+        p_f (np.ndarray): Predicted values for forces.
+        ids (np.ndarray): Sample identifiers.
     """
     if subset_keys is not None:
         idx = df.index.unique(level=0).intersection(subset_keys)
         if len(idx) == 0:
-            return list(), list(), list(), list()
+            # Return empty arrays if no matching keys are found
+            return np.array([]), np.array([]), np.array([]), np.array([]), np.array([]), []
         df = df.loc[idx]
-    x_e, y_e, x_f, y_f = dataframe_to_tuples(df,
-                                             **kwargs)
+    else:
+        print("SUBSET KEYS IS NONE")
+        return np.array([]), np.array([]), np.array([]), np.array([]), [], []
+
+    # Extract input features and target values
+    x_e, y_e, x_f, y_f, force_labels = dataframe_to_tuples_with_names(df, **kwargs)
+
+    # Generate predictions using the fitted model
     p_e = model.predict(x_e)
     p_f = model.predict(x_f)
-    return y_e, p_e, y_f, p_f
+
+    # Extract identifiers (e.g., sample IDs)
+    ids = df.index.unique(level=0)
+
+    return y_e, p_e, y_f, p_f, list(ids), list(force_labels)
 
 
-def batched_prediction(model: WeightedLinearModel,
-                       filename: str,
-                       table_names: Collection = None,
-                       subset_keys: Collection = None,
-                       drop_columns: List[str] = None,
-                       **kwargs):
+def batched_prediction_multiple_files(
+    model: WeightedLinearModel,
+    filenames: List[str],
+    table_names: Collection = None,
+    subset_keys: Collection = None,
+    drop_columns: List[str] = None,
+    **kwargs
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Convenience function for optimization workflow. Read inputs/outputs
-    from HDF5 file and predict using fitted model.
+    from multiple HDF5 files and predict using fitted model.
 
     Args:
-        filename (str): path to HDF5 file.
+        filenames (list): list of paths to HDF5 files.
         model (WeightedLinearModel): fitted model.
         table_names (list): list of table names to query from HDF5 file.
         subset_keys (list): list of keys to query from DataFrame.
         drop_columns (list): list of columns to drop. Used when modifying
             the cutoffs of the feature vectors from HDF5 file. No internal
-            checks are performed to see if dropping provided columns produce
+            checks are performed to see if dropping provided columns produces
             features of the intended cutoffs. Use with Caution.
 
     Returns:
@@ -988,30 +1471,77 @@ def batched_prediction(model: WeightedLinearModel,
         y_f (np.ndarray): target values for forces.
         p_f (np.ndarray): prediction values for forces.
     """
+    
+    def dataframe_batch_loader_multiple_files(filenames: List[str], table_names: Collection):
+        """
+        Iterator for reading DataFrames from multiple HDF5 files in batches.
+        """
+        for filename in filenames:
+            if not os.path.isfile(filename):
+                raise FileNotFoundError(f"{filename} not found.")
+            
+            tables_to_read = table_names or io.analyze_hdf_tables(filename)[2]
+            for table_name in tables_to_read:
+                df = pd.read_hdf(filename, table_name)
+                yield df
+
+    y_e, p_e, y_f, p_f, ids, force_ids = [], [], [], [], [], []
+
+    # Load DataFrame batches and process predictions
+    for df in dataframe_batch_loader_multiple_files(filenames, table_names):
+        if drop_columns:
+            df.drop(columns=drop_columns, inplace=True)
+        
+        # Perform predictions using the fitted model
+        results = subset_prediction(df, model, subset_keys=subset_keys, **kwargs)
+        
+        # Append energy and force predictions and targets
+        y_e.extend(results[0])
+        p_e.extend(results[1])
+        y_f.extend(results[2])
+        p_f.extend(results[3])
+        ids.extend(results[4])
+        force_ids.extend(results[5])
+
+    return np.array(y_e), np.array(p_e), np.array(y_f), np.array(p_f),list(ids), list(force_ids)
+
+
+def batched_prediction(model: WeightedLinearModel,
+                       filename: str,
+                       table_names: Collection = None,
+                       subset_keys: Collection = None,
+                       drop_columns: List[str] = None,
+                       **kwargs) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list, list]:
+    """
+    Convenience function for optimization workflow. Read inputs/outputs
+    from HDF5 file and predict using fitted model.
+
+    Returns:
+        y_e (np.ndarray): target values for energies.
+        p_e (np.ndarray): prediction values for energies.
+        y_f (np.ndarray): target values for forces.
+        p_f (np.ndarray): prediction values for forces.
+        ids (np.ndarray): identifiers of the samples.
+    """
     if table_names is None:
         _, _, table_names, _ = io.analyze_hdf_tables(filename)
     df_batches = io.dataframe_batch_loader(filename, table_names)
-    y_e = []
-    p_e = []
-    y_f = []
-    p_f = []
-    for df in df_batches:
-        if drop_columns != None:
-            df.drop(columns=drop_columns,inplace=True)
+    y_e, p_e, y_f, p_f, ids,force_ids = [], [], [], [], [],[]
 
-        predictions = subset_prediction(df,
-                                        model,
-                                        subset_keys=subset_keys,
-                                        **kwargs)
-        y_e.append(predictions[0])
-        p_e.append(predictions[1])
-        y_f.append(predictions[2])
-        p_f.append(predictions[3])
-    y_e = np.concatenate(y_e)
-    p_e = np.concatenate(p_e)
-    y_f = np.concatenate(y_f)
-    p_f = np.concatenate(p_f)
-    return y_e, p_e, y_f, p_f
+    for df in df_batches:
+        if drop_columns is not None:
+            df.drop(columns=drop_columns, inplace=True)
+
+        results = subset_prediction(df, model, subset_keys=subset_keys, **kwargs)
+        y_e.extend(results[0])
+        p_e.extend(results[1])
+        y_f.extend(results[2])
+        p_f.extend(results[3])
+        ids.extend(results[4])
+        force_ids.extend(results[5])
+
+    return np.array(y_e), np.array(p_e), np.array(y_f), np.array(p_f),list(ids), list(force_ids)
+
 
 
 def rmse_metric(predicted: Collection,
@@ -1160,10 +1690,19 @@ def calc_E_F_weights(n_e, n_f, std_e, std_f):
         energy_weight (float): weight applied to energy components.
         force_weight (float): weight applied to force components.
     """
-    if std_e == 0:  # single point or really bad dataset
-        energy_weight = 1.0
-        force_weight = 1 / np.sqrt(n_f)
+    if n_e == 0 or std_e == 0:
+        print("n_e or std_e are 0!")
+        energy_weight = 0.0
     else:
-        energy_weight = 1 / np.sqrt(n_e) / std_e
-        force_weight = 1 / np.sqrt(n_f) / std_f
+        energy_weight = 1.0 / (np.sqrt(n_e) * std_e)
+
+    # If we have no forces or zero std, set that weight to 0
+    if n_f == 0 or std_f == 0:
+        print("n_f or std_f are 0!")
+        force_weight = 0.0
+    else:
+        force_weight = 1.0 / (np.sqrt(n_f) * std_f)
+
     return energy_weight, force_weight
+
+    

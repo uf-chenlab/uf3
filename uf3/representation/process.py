@@ -357,6 +357,7 @@ class BasisFeaturizer:
             for j, component in enumerate(['fx', 'fy', 'fz']):
                 for i in range(n_atoms):
                     vector = vectors[i, j, :]
+                    
                     vector = np.insert(vector, 0, forces[j][i])
                     atom_index = component + '_' + str(i)
                     if name is not None:
