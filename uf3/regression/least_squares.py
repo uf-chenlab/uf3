@@ -9,7 +9,7 @@ from uf3.data import io
 from uf3.data import composition
 from uf3.util import json_io
 from uf3.util import parallel
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 
@@ -418,65 +418,67 @@ class WeightedLinearModel(BasicLinearModel):
         n_tables, _, table_names, _ = io.analyze_hdf_tables(filename)
         gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
     
-        # Prepare progress bar
+        # Initialize global variance recorders
+        e_variance_global = VarianceRecorder()
+        f_variance_global = VarianceRecorder()
+
+        # Use ThreadPoolExecutor (or ProcessPoolExecutor) locally on *this* worker
         with ThreadPoolExecutor(max_workers=num_cores) as executor:
-            # Use tqdm to show progress
+            # Submit tasks for each table
+            futures = []
+            for j in range(n_tables):
+                future = executor.submit(
+                    WeightedLinearModel.process_table,
+                    j,
+                    table_names,
+                    filename,
+                    subset,
+                    batch_size,
+                    sample_weights,
+                    energy_key,
+                    self
+                )
+                futures.append(future)
+
+            # Collect results as they complete
             with tqdm(total=n_tables, desc="Processing Tables", unit="table") as pbar:
-                # Wrapper function for updating progress
-                def track_progress(result):
-                    pbar.update()
-    
-                # Submit tasks with callback for updating the progress bar
-                futures = [
-                    executor.submit(
-                        WeightedLinearModel.process_table,
-                        j,
-                        table_names,
-                        filename,
-                        subset,
-                        batch_size,
-                        sample_weights,
-                        energy_key,
-                        self
-                    ) for j in range(n_tables)
-                ]
-    
-                results = []
-                for future in futures:
-                    # Wait for the task to finish and append the result
+                for future in as_completed(futures):
                     result = future.result()
-                    results.append(result)
-                    track_progress(result)
-    
-        # Aggregate results
-        e_means, e_stds, e_ns = [], [], []
-        f_means, f_stds, f_ns = [], [], []
-    
-        for result in results:
-            if result is not None:
-                g_e, g_f, o_e, o_f, local_e_variance, local_f_variance = result
-                gram_e += g_e
-                gram_f += g_f
-                ord_e += o_e
-                ord_f += o_f
-                e_means.append((local_e_variance.mean, local_e_variance.std, local_e_variance.n))
-                f_means.append((local_f_variance.mean, local_f_variance.std, local_f_variance.n))
-    
-        # Combine variances from all tables
-        def combine_variances(variance_list):
-            combined = VarianceRecorder()
-            for mean, std, n in variance_list:
-                if n > 0:  # Ensure there are valid samples
-                    # Update the combined variance recorder directly
-                    combined.update_manual(mean, std, n)  # Use update() instead of update_with_components
-            return combined
-    
-        e_variance = combine_variances(e_means)
-        f_variance = combine_variances(f_means)
-    
-        # Compute weights
-        energy_weight, force_weight = calc_E_F_weights(e_variance.n, f_variance.n, e_variance.std, f_variance.std)
-        # Combine gram matrices and fit
+                    pbar.update()
+
+                    # If table had no matching keys, result is None
+                    if result is None:
+                        continue
+
+                    (g_e, g_f, o_e, o_f, local_e_variance, local_f_variance) = result
+
+                    # Merge partial Gram/ordinate into the global aggregator
+                    gram_e += g_e
+                    gram_f += g_f
+                    ord_e  += o_e
+                    ord_f  += o_f
+
+                    # Merge local variance recorders
+                    if local_e_variance.n > 0:
+                        e_variance_global.update_manual(
+                            local_e_variance.mean,
+                            local_e_variance.std,
+                            local_e_variance.n
+                        )
+                    if local_f_variance.n > 0:
+                        f_variance_global.update_manual(
+                            local_f_variance.mean,
+                            local_f_variance.std,
+                            local_f_variance.n
+                        )
+
+        # Now we have final Gram/ordinate and variance recorders
+        energy_weight, force_weight = calc_E_F_weights(
+            e_variance_global.n, f_variance_global.n,
+            e_variance_global.std, f_variance_global.std
+        )
+
+        # Combine Gram matrices (energy and force) and do the final fit
         gram, ordinate = self.combine_weighted_gram(
             gram_e, gram_f, ord_e, ord_f,
             energy_weight, force_weight, weight
@@ -657,65 +659,67 @@ class WeightedLinearModel(BasicLinearModel):
             filenames_list = filenames_list + [filename for _ in table_name]
         gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
     
-        # Prepare progress bar
+       # Initialize global variance recorders
+        e_variance_global = VarianceRecorder()
+        f_variance_global = VarianceRecorder()
+
+        # Use ThreadPoolExecutor (or ProcessPoolExecutor) locally on *this* worker
         with ThreadPoolExecutor(max_workers=num_cores) as executor:
-            # Use tqdm to show progress
+            # Submit tasks for each table
+            futures = []
+            for j in range(n_tables):
+                future = executor.submit(
+                    WeightedLinearModel.process_table,
+                    j,
+                    table_names,
+                    filename,
+                    subset,
+                    batch_size,
+                    sample_weights,
+                    energy_key,
+                    self
+                )
+                futures.append(future)
+
+            # Collect results as they complete
             with tqdm(total=n_tables, desc="Processing Tables", unit="table") as pbar:
-                # Wrapper function for updating progress
-                def track_progress(result):
-                    pbar.update()
-    
-                # Submit tasks with callback for updating the progress bar
-                futures = [
-                    executor.submit(
-                        WeightedLinearModel.process_table,
-                        j,
-                        table_names,
-                        filenames_list[j],
-                        subset,
-                        batch_size,
-                        sample_weights,
-                        energy_key,
-                        self
-                    ) for j in range(n_tables)
-                ]
-    
-                results = []
-                for future in futures:
-                    # Wait for the task to finish and append the result
+                for future in as_completed(futures):
                     result = future.result()
-                    results.append(result)
-                    track_progress(result)
-    
-        # Aggregate results
-        e_means, e_stds, e_ns = [], [], []
-        f_means, f_stds, f_ns = [], [], []
-    
-        for result in results:
-            if result is not None:
-                g_e, g_f, o_e, o_f, local_e_variance, local_f_variance = result
-                gram_e += g_e
-                gram_f += g_f
-                ord_e += o_e
-                ord_f += o_f
-                e_means.append((local_e_variance.mean, local_e_variance.std, local_e_variance.n))
-                f_means.append((local_f_variance.mean, local_f_variance.std, local_f_variance.n))
-    
-        # Combine variances from all tables
-        def combine_variances(variance_list):
-            combined = VarianceRecorder()
-            for mean, std, n in variance_list:
-                if n > 0:  # Ensure there are valid samples
-                    # Update the combined variance recorder directly
-                    combined.update_manual(mean, std, n)  # Use update() instead of update_with_components
-            return combined
-    
-        e_variance = combine_variances(e_means)
-        f_variance = combine_variances(f_means)
-    
-        # Compute weights
-        energy_weight, force_weight = calc_E_F_weights(e_variance.n, f_variance.n, e_variance.std, f_variance.std)
-        # Combine gram matrices and fit
+                    pbar.update()
+
+                    # If table had no matching keys, result is None
+                    if result is None:
+                        continue
+
+                    (g_e, g_f, o_e, o_f, local_e_variance, local_f_variance) = result
+
+                    # Merge partial Gram/ordinate into the global aggregator
+                    gram_e += g_e
+                    gram_f += g_f
+                    ord_e  += o_e
+                    ord_f  += o_f
+
+                    # Merge local variance recorders
+                    if local_e_variance.n > 0:
+                        e_variance_global.update_manual(
+                            local_e_variance.mean,
+                            local_e_variance.std,
+                            local_e_variance.n
+                        )
+                    if local_f_variance.n > 0:
+                        f_variance_global.update_manual(
+                            local_f_variance.mean,
+                            local_f_variance.std,
+                            local_f_variance.n
+                        )
+
+        # Now we have final Gram/ordinate and variance recorders
+        energy_weight, force_weight = calc_E_F_weights(
+            e_variance_global.n, f_variance_global.n,
+            e_variance_global.std, f_variance_global.std
+        )
+
+        # Combine Gram matrices (energy and force) and do the final fit
         gram, ordinate = self.combine_weighted_gram(
             gram_e, gram_f, ord_e, ord_f,
             energy_weight, force_weight, weight
