@@ -11,7 +11,7 @@ from uf3.util import json_io
 from uf3.util import parallel
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
-
+import gc
 
 class VarianceRecorder:
     """Convenience class for computing online variance and mean"""
@@ -297,7 +297,7 @@ class WeightedLinearModel(BasicLinearModel):
             x_f: np.ndarray = None,
             y_f: np.ndarray = None,
             weight: float = 0.5,
-            batch_size=2500,
+            batch_size=500,
             ):
         """
         Direct solution from input-output pairs corresponding to
@@ -371,7 +371,59 @@ class WeightedLinearModel(BasicLinearModel):
         ordinate = ((weight * energy_weight**2 * ord_e)
                     + ((1 - weight) * force_weight**2 * ord_f))
         return gram, ordinate
-   
+    
+    @staticmethod    
+    def process_table_chunked(j,
+                          table_names,
+                          filenames_list,
+                          subset,
+                          batch_size,
+                          sample_weights,
+                          energy_key,
+                          model_instance,
+                          chunk_size=250000):
+        table_name = table_names[j]
+        filename = filenames_list[j]
+        print("processing file: ", filename)
+
+        # Local accumulators
+        gram_e, gram_f, ord_e, ord_f = model_instance.initialize_gram_ordinate()
+        local_e_variance = VarianceRecorder()
+        local_f_variance = VarianceRecorder()
+
+        if not os.path.isfile(filename):
+            return None
+        def chunk_table_reader(filename, table_name, chunk_size=250000):
+            store = pd.HDFStore(filename, mode='r')
+            start = 0
+            while True:
+                df_chunk = store.select(table_name, start=start, stop=start + chunk_size)
+                if df_chunk.empty:
+                    break
+                yield df_chunk
+                start += chunk_size
+            store.close()
+        # Read in chunks
+        for df_chunk in chunk_table_reader(filename, table_name, chunk_size=chunk_size):
+            keys = df_chunk.index.unique(level=0).intersection(subset)
+            if len(keys) == 0:
+                continue
+            df_chunk = df_chunk.loc[keys]
+
+            g_e, g_f, o_e, o_f = model_instance.gram_from_df(
+                df_chunk,
+                keys,
+                e_variance=local_e_variance,
+                f_variance=local_f_variance,
+                sample_weights=sample_weights,
+                energy_key=energy_key,
+                batch_size=batch_size
+            )
+            gram_e[:], gram_f[:], ord_e[:], ord_f[:] = gram_e + g_e, gram_f + g_f, ord_e + o_e, ord_f + o_f
+
+            del df_chunk, g_e, g_f, o_e, o_f  # Free memory
+
+        return gram_e, gram_f, ord_e, ord_f, local_e_variance, local_f_variance
     @staticmethod
     def process_table(j, table_names, filename, subset, batch_size, sample_weights, energy_key, model_instance):
         """
@@ -403,7 +455,7 @@ class WeightedLinearModel(BasicLinearModel):
                            filename: str,
                            subset: Collection,
                            weight: float = 0.5,
-                           batch_size=2500,
+                           batch_size=500,
                            sample_weights: Dict = None,
                            energy_key="energy",
                            num_cores=1,
@@ -487,7 +539,7 @@ class WeightedLinearModel(BasicLinearModel):
                       filename: str,
                       subset: Collection,
                       weight: float = 0.5,
-                      batch_size=2500,
+                      batch_size=500,
                       sample_weights: Dict = None,
                       energy_key="energy",
                       progress: str = "bar",
@@ -558,7 +610,7 @@ class WeightedLinearModel(BasicLinearModel):
                       filenames: List,
                       subset: Collection,
                       weight: float = 0.5,
-                      batch_size=2500,
+                      batch_size=500,
                       sample_weights: Dict = None,
                       energy_key="energy",
                       progress: str = "bar"):
@@ -626,7 +678,7 @@ class WeightedLinearModel(BasicLinearModel):
                       filenames: List,
                       subset: Collection,
                       weight: float = 0.5,
-                      batch_size=2500,
+                      batch_size=500,
                       sample_weights: Dict = None,
                       energy_key="energy",
                       num_cores=1,
@@ -647,6 +699,7 @@ class WeightedLinearModel(BasicLinearModel):
         """
         n_tables = 0
         table_names = []
+        print('batchsize: ', batch_size)
         filenames_list = []
         for filename in filenames:
             if not os.path.isfile(filename):
@@ -656,51 +709,37 @@ class WeightedLinearModel(BasicLinearModel):
             table_names = table_names + table_name
             filenames_list = filenames_list + [filename for _ in table_name]
         gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
-    
+        # Aggregate results
+        e_means = [] 
+        f_means = []
         # Prepare progress bar
         with ThreadPoolExecutor(max_workers=num_cores) as executor:
-            # Use tqdm to show progress
-            with tqdm(total=n_tables, desc="Processing Tables", unit="table") as pbar:
-                # Wrapper function for updating progress
-                def track_progress(result):
-                    pbar.update()
+            futures = []
+            table_iterator = parallel.progress_iter(np.arange(n_tables), style=progress)
+            for j in table_iterator:
+                futures.append(executor.submit(
+                    WeightedLinearModel.process_table_chunked,
+                    j,
+                    table_names,
+                    filenames_list,
+                    subset,
+                    batch_size,
+                    sample_weights,
+                    energy_key,
+                    self,
+                    chunk_size=250000
+                ))
     
-                # Submit tasks with callback for updating the progress bar
-                futures = [
-                    executor.submit(
-                        WeightedLinearModel.process_table,
-                        j,
-                        table_names,
-                        filenames_list[j],
-                        subset,
-                        batch_size,
-                        sample_weights,
-                        energy_key,
-                        self
-                    ) for j in range(n_tables)
-                ]
-    
-                results = []
-                for future in futures:
-                    # Wait for the task to finish and append the result
-                    result = future.result()
-                    results.append(result)
-                    track_progress(result)
-    
-        # Aggregate results
-        e_means, e_stds, e_ns = [], [], []
-        f_means, f_stds, f_ns = [], [], []
-    
-        for result in results:
-            if result is not None:
-                g_e, g_f, o_e, o_f, local_e_variance, local_f_variance = result
-                gram_e += g_e
-                gram_f += g_f
-                ord_e += o_e
-                ord_f += o_f
-                e_means.append((local_e_variance.mean, local_e_variance.std, local_e_variance.n))
-                f_means.append((local_f_variance.mean, local_f_variance.std, local_f_variance.n))
-    
+            for fut in tqdm(futures, total=len(futures), desc="Combining Results", unit="table"):
+                result = fut.result()
+                if result is not None:
+                    g_e, g_f, o_e, o_f, local_e_var, local_f_var = result
+                    gram_e[:], gram_f[:], ord_e[:], ord_f[:] = gram_e + g_e, gram_f + g_f, ord_e + o_e, ord_f + o_f
+                    e_means.append((local_e_var.mean, local_e_var.std, local_e_var.n))
+                    f_means.append((local_f_var.mean, local_f_var.std, local_f_var.n))
+                    del result, g_e, g_f, o_e, o_f, local_e_var, local_f_var
+                    gc.collect()
+                    
         # Combine variances from all tables
         def combine_variances(variance_list):
             combined = VarianceRecorder()
@@ -737,7 +776,7 @@ class WeightedLinearModel(BasicLinearModel):
                      f_variance: VarianceRecorder = None,
                      sample_weights: Dict = None,
                      energy_key: str = "energy",
-                     batch_size: int = 2500):
+                     batch_size: int = 500):
         """
         Extract inputs and outputs from dataframe and compute
         moore-penrose components (gram matrices and ordinates).
