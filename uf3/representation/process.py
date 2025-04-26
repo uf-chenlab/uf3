@@ -548,18 +548,14 @@ def save_feature_db(dataframe, filename, table_name='features'):
     dataframe.to_hdf(filename, table_name, mode="a", format='fixed')
 
 
-def load_feature_db(filename, table_name='features'):
-    """
-    Load dataframe with sqlite.
-
-    Args:
-        filename (str)
-        table_name (str): default "features".
-
-    Returns:
-        dataframe (pd.DataFrame)
-    """
+def load_feature_db(filename, table_name='features', keys=None):
     dataframe = pd.read_hdf(filename, table_name)
+    if keys is not None:
+        table_keys = dataframe.index.unique(level=0)
+        matching_keys = table_keys.intersection(keys)
+        if len(matching_keys) == 0:
+            return None
+        dataframe = dataframe.loc[matching_keys]
     return dataframe
 
 

@@ -847,8 +847,9 @@ def parse_with_subsampling(data_paths: List[str],
                            vasp_pressure: bool = False,
                            lammps_log: str = None,
                            lammps_aliases: Dict[int, str] = None,
-                           style:str = "text",
-                           verbose: bool = False):
+                           style: str = "text",
+                           verbose: bool = False,
+                           prefixes: Dict[str, str] = None):
     """
     TODO: refactor to break up into smaller, reusable functions
 
@@ -856,15 +857,12 @@ def parse_with_subsampling(data_paths: List[str],
         data_paths (list)
         data_coordinator (DataCoordinator)
         max_samples (int): maximum number of samples taken per provided path.
-            Default: 100
-        min_diff (float): minimum energy difference between consecutive samples
-            in eV. Default: 1e-3
-        vasp_pressure (bool): whether to search for pressure and apply an
-            energy correction of Pressure * Volume term (H = E + PV).
-        lammps_log (str): optional name of lammps log, if applicable.
-        lammps_aliases (dict): map of LAMMPS type to species.
-        style (str): style for printing progress. Default: text.
-        verbose (bool): whether to report number of samples taken per entry.
+        min_diff (float): minimum energy difference between consecutive samples.
+        vasp_pressure (bool): whether to apply PV correction.
+        lammps_log (str): optional LAMMPS log filename.
+        lammps_aliases (dict): map of LAMMPS types to elements.
+        style (str): progress style.
+        verbose (bool): verbose output toggle.
     """
     common_prefix = os.path.commonprefix(data_paths)
     common_path = os.path.dirname(common_prefix)
@@ -874,10 +872,7 @@ def parse_with_subsampling(data_paths: List[str],
     size_key = data_coordinator.size_key
 
     for data_path in parallel.progress_iter(data_paths, style=style):
-        prefix = data_path[len(common_path):]
-        prefix = prefix.replace("/", "-")
-        if prefix[0] == "-":
-            prefix = prefix[1:]
+        prefix = prefixes[data_path] if prefixes else data_path[len(common_path):].lstrip("/").replace("/", "-")
 
         try:
             if lammps_log is not None:
@@ -889,13 +884,17 @@ def parse_with_subsampling(data_paths: List[str],
                     log_fname=lammps_log, dump_fname=dump_fname,
                     column_subs={"TotEng": "energy"})
             else:
-                df = data_coordinator.dataframe_from_trajectory(data_path,
-                                                                prefix=prefix,
-                                                                load=False)
-        except ValueError:
+                try: 
+                    df = data_coordinator.dataframe_from_trajectory(
+                        data_path, prefix=prefix, load=False)
+                except:
+                    continue
+        except:
             continue
+
         if len(df) == 0:
             continue
+
         energy_list = df[energy_key].values / df[size_key].values
         energy_list = energy_list.astype(float)
 
@@ -908,6 +907,7 @@ def parse_with_subsampling(data_paths: List[str],
                 min_diff=min_diff)
         else:
             subsamples = np.arange(len(energy_list))
+
         if verbose:
             print("{}/{} samples taken from {}.".format(len(subsamples),
                                                         len(energy_list),
@@ -915,6 +915,7 @@ def parse_with_subsampling(data_paths: List[str],
         counter += len(subsamples)
         if verbose:
             print("Total: {} samples parsed.".format(counter))
+
         df = df.iloc[np.sort(subsamples)]
 
         if vasp_pressure:
@@ -925,10 +926,9 @@ def parse_with_subsampling(data_paths: List[str],
                 corrections = np.multiply(volumes, external_pressure)
                 df[energy_key] = np.subtract(df['energy'], corrections)
             if verbose >= 1:
-                line = "External pressure correction: {} kbar."
-                print(line.format(external_pressure))
-        data_coordinator.load_dataframe(df, prefix=prefix)
+                print("External pressure correction: {} kbar.".format(external_pressure))
 
+        data_coordinator.load_dataframe(df, prefix=prefix)
 
 def cache_data(df_data: pd.DataFrame,
                filename: str,
