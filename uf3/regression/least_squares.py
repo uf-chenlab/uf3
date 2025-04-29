@@ -822,12 +822,13 @@ class WeightedLinearModel(BasicLinearModel):
                              batch_size=2500,
                              sample_weights: Dict = None,
                              energy_key="energy",
-                             num_cores=1,
+                             num_cores=2,
                              progress: str = "bar"):
         gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
         e_variance = VarianceRecorder()
         f_variance = VarianceRecorder()
 
+        # Prepares the (filename, table_name) pairs
         table_jobs = []
 
         for filename in filenames:
@@ -840,57 +841,86 @@ class WeightedLinearModel(BasicLinearModel):
         if not table_jobs:
             raise ValueError("No tables found.")
 
-        # spread tables across all cores
-        table_splits = np.array_split(table_jobs, num_cores)
+        # Function to load a table
+        def load_table(job):
+            filename, table_name = job
+            try:
+                df = process.load_feature_db(filename, table_name, subset)
+                if df is not None and len(df.index) > 0:
+                    print(f"Loaded {table_name} from {filename}, shape: {df.shape}")
+                    print_mem()
+                    return (filename, table_name), df
+            except Exception as e:
+                print(f"Failed loading {filename}:{table_name}: {e}")
+            return None  # Failed load or empty
 
-        def process_table_batch(table_batch):
+        # Parallel load all tables
+        all_data = {}  # key: (filename, table_name), value: df
+
+        with ThreadPoolExecutor(max_workers=max(1, num_cores - 1)) as executor:
+            futures = {executor.submit(load_table, job): job for job in table_jobs}
+
+            if progress == "bar":
+                from tqdm import tqdm
+                pbar = tqdm(total=len(futures), desc="Loading Data", unit="table")
+
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    key, df = result
+                    all_data[key] = df
+                    print_mem()
+                if progress == "bar":
+                    pbar.update()
+
+            if progress == "bar":
+                pbar.close()
+
+        # Split the loaded data across all cores (not the table names, but the data itself)
+        data_splits = np.array_split(table_jobs,max(1, num_cores - 1))
+
+        # Function to process a chunk of data (data split across cores)
+        def process_data_chunk(data_chunk):
+            
             local_gram_e, local_gram_f, local_ord_e, local_ord_f = self.initialize_gram_ordinate()
             local_e_var = VarianceRecorder()
             local_f_var = VarianceRecorder()
 
-            for filename, table_name in table_batch:
-                print(f"Loading table {table_name} from {filename}")
-                print_mem()
-
-                df = process.load_feature_db(filename, table_name, subset)
-                if df is None or len(df.index) == 0:
+            for d_group in data_chunk:
+                filename, table_name = d_group  # <-- Correct unpack
+                df = all_data.get((filename, table_name))
+                if df is None:
                     continue
-
                 keys = df.index.unique(level=0)
+                print(f'Processing data of length: {len(df)} from {filename}/{table_name}')
 
                 if len(keys) == 0:
-                    del df
                     continue
 
-                sub_splits = np.array_split(keys, max(1, len(keys) // batch_size))
+                result = WeightedLinearModel.process_keys(
+                    df,
+                    keys,
+                    batch_size,
+                    sample_weights,
+                    energy_key,
+                    self
+                )
+                print_mem()
+                if result is not None:
+                    g_e, g_f, o_e, o_f, e_var, f_var = result
+                    np.add(local_gram_e, g_e, out=local_gram_e)
+                    np.add(local_gram_f, g_f, out=local_gram_f)
+                    np.add(local_ord_e, o_e, out=local_ord_e)
+                    np.add(local_ord_f, o_f, out=local_ord_f)
 
-                for key_split in sub_splits:
-                    if len(key_split) == 0:
-                        continue
-
-                    result = WeightedLinearModel.process_keys(
-                        df,
-                        key_split,
-                        batch_size,
-                        sample_weights,
-                        energy_key,
-                        self
-                    )
-
-                    if result is not None:
-                        g_e, g_f, o_e, o_f, e_var, f_var = result
-                        np.add(local_gram_e, g_e, out=local_gram_e)
-                        np.add(local_gram_f, g_f, out=local_gram_f)
-                        np.add(local_ord_e, o_e, out=local_ord_e)
-                        np.add(local_ord_f, o_f, out=local_ord_f)
-
-                        local_e_var.update_manual(e_var.mean, e_var.std, e_var.n)
-                        local_f_var.update_manual(f_var.mean, f_var.std, f_var.n)
+                    local_e_var.update_manual(e_var.mean, e_var.std, e_var.n)
+                    local_f_var.update_manual(f_var.mean, f_var.std, f_var.n)
 
             return local_gram_e, local_gram_f, local_ord_e, local_ord_f, local_e_var, local_f_var
 
-        with ThreadPoolExecutor(max_workers=num_cores) as executor:
-            futures = {executor.submit(process_table_batch, split): i for i, split in enumerate(table_splits) if len(split) > 0}
+        # Run the parallel processing across the cores
+        with ThreadPoolExecutor(max_workers=max(1, num_cores - 1)) as executor:
+            futures = {executor.submit(process_data_chunk, data_split): i for i, data_split in enumerate(data_splits)}
 
             with tqdm(total=len(futures), desc="Processing Tables", unit="batch") as pbar:
                 for future in as_completed(futures):
@@ -905,19 +935,20 @@ class WeightedLinearModel(BasicLinearModel):
                         e_variance.update_manual(e_var.mean, e_var.std, e_var.n)
                         f_variance.update_manual(f_var.mean, f_var.std, f_var.n)
 
-                    pbar.update()
+                        pbar.update()
+                        print_mem()
 
+        # After all futures are done, calculate final weights
         energy_weight, force_weight = calc_E_F_weights(
-            e_variance.n, f_variance.n,
-            e_variance.std, f_variance.std
+            e_variance.n, f_variance.n, e_variance.std, f_variance.std
         )
 
         gram, ordinate = self.combine_weighted_gram(
-            gram_e, gram_f, ord_e, ord_f,
-            energy_weight, force_weight, weight
+            gram_e, gram_f, ord_e, ord_f, energy_weight, force_weight, weight
         )
 
         self.fit_with_gram(gram, ordinate)
+
 
 
 
