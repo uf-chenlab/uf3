@@ -548,7 +548,7 @@ def save_feature_db(dataframe, filename, table_name='features'):
     dataframe.to_hdf(filename, table_name, mode="a", format='fixed')
 
 
-def load_feature_db(filename, table_name='features', keys=None):
+def load_feature_db(filename, table_name=None, keys=None):
     dataframe = pd.read_hdf(filename, table_name)
     if keys is not None:
         table_keys = dataframe.index.unique(level=0)

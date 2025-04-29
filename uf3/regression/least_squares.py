@@ -14,6 +14,7 @@ from concurrent.futures import as_completed
 from tqdm import tqdm
 import gc
 import psutil, os
+import time
 
 def print_mem():
     process = psutil.Process(os.getpid())
@@ -471,6 +472,29 @@ class WeightedLinearModel(BasicLinearModel):
         ordinate_f = np.asarray(ordinate_f, dtype=np.float64)
 
         return gram_e, gram_f, ordinate_e, ordinate_f, local_e_variance, local_f_variance
+    
+    @staticmethod
+    def process_keys(df, keys, batch_size, sample_weights, energy_key, model_instance):
+        # local vars for each thread
+        local_e_variance = VarianceRecorder()
+        local_f_variance = VarianceRecorder()
+
+        gram_e, gram_f, ordinate_e, ordinate_f = model_instance.gram_from_df(
+            df, keys,
+            e_variance=local_e_variance,
+            f_variance=local_f_variance,
+            sample_weights=sample_weights,
+            energy_key=energy_key,
+            batch_size=batch_size
+        )
+
+        gram_e = np.asarray(gram_e, dtype=np.float64)
+        gram_f = np.asarray(gram_f, dtype=np.float64)
+        ordinate_e = np.asarray(ordinate_e, dtype=np.float64)
+        ordinate_f = np.asarray(ordinate_f, dtype=np.float64)
+
+        return gram_e, gram_f, ordinate_e, ordinate_f, local_e_variance, local_f_variance
+
     def fit_from_file_parallel(self,
                            filename: str,
                            subset: Collection,
@@ -790,68 +814,98 @@ class WeightedLinearModel(BasicLinearModel):
         print("ordinate norm:", np.linalg.norm(ordinate))
 
         self.fit_with_gram(gram, ordinate)
-    def fit_from_files_parallel(self,
+    
+    def fit_from_files_parallel(self, 
                              filenames: List,
                              subset: Collection,
                              weight: float = 0.5,
-                             batch_size=250,
+                             batch_size=2500,
                              sample_weights: Dict = None,
                              energy_key="energy",
                              num_cores=1,
                              progress: str = "bar"):
-        n_tables = 0
-        table_names = []
-        filenames_list = []
-        for filename in filenames:
-            if not os.path.isfile(filename):
-                raise FileNotFoundError(filename)
-            n_table, _, table_name, _ = io.analyze_hdf_tables(filename)
-            n_tables = n_tables + n_table
-            table_names = table_names + table_name
-            filenames_list = filenames_list + [filename for _ in table_name]
         gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
         e_variance = VarianceRecorder()
         f_variance = VarianceRecorder()
 
+        table_jobs = []
 
-        with ThreadPoolExecutor(max_workers=num_cores) as executor:
-            futures = {
-                executor.submit(
-                    WeightedLinearModel.process_table,
-                    j,
-                    table_names,
-                    filenames_list[j],
-                    subset,
-                    batch_size,
-                    sample_weights,
-                    energy_key,
-                    self
-                ): j for j in range(n_tables)
-            }
+        for filename in filenames:
+            if not os.path.isfile(filename):
+                raise FileNotFoundError(filename)
+            n_table, _, table_names, _ = io.analyze_hdf_tables(filename)
+            for table_name in table_names:
+                table_jobs.append((filename, table_name))
 
-            with tqdm(total=n_tables, desc="Processing Tables", unit="table") as pbar:
-                for future in as_completed(futures):
-                    print("for future in as complete")
-                    print_mem()
-                    result = future.result()
-                    pbar.update()
+        if not table_jobs:
+            raise ValueError("No tables found.")
+
+        # spread tables across all cores
+        table_splits = np.array_split(table_jobs, num_cores)
+
+        def process_table_batch(table_batch):
+            local_gram_e, local_gram_f, local_ord_e, local_ord_f = self.initialize_gram_ordinate()
+            local_e_var = VarianceRecorder()
+            local_f_var = VarianceRecorder()
+
+            for filename, table_name in table_batch:
+                print(f"Loading table {table_name} from {filename}")
+                print_mem()
+
+                df = process.load_feature_db(filename, table_name, subset)
+                if df is None or len(df.index) == 0:
+                    continue
+
+                keys = df.index.unique(level=0)
+
+                if len(keys) == 0:
+                    del df
+                    continue
+
+                sub_splits = np.array_split(keys, max(1, len(keys) // batch_size))
+
+                for key_split in sub_splits:
+                    if len(key_split) == 0:
+                        continue
+
+                    result = WeightedLinearModel.process_keys(
+                        df,
+                        key_split,
+                        batch_size,
+                        sample_weights,
+                        energy_key,
+                        self
+                    )
 
                     if result is not None:
-                        g_e, g_f, o_e, o_f, local_e_var, local_f_var = result
-                        print("right before +=")
-                        print_mem()
+                        g_e, g_f, o_e, o_f, e_var, f_var = result
+                        np.add(local_gram_e, g_e, out=local_gram_e)
+                        np.add(local_gram_f, g_f, out=local_gram_f)
+                        np.add(local_ord_e, o_e, out=local_ord_e)
+                        np.add(local_ord_f, o_f, out=local_ord_f)
+
+                        local_e_var.update_manual(e_var.mean, e_var.std, e_var.n)
+                        local_f_var.update_manual(f_var.mean, f_var.std, f_var.n)
+
+            return local_gram_e, local_gram_f, local_ord_e, local_ord_f, local_e_var, local_f_var
+
+        with ThreadPoolExecutor(max_workers=num_cores) as executor:
+            futures = {executor.submit(process_table_batch, split): i for i, split in enumerate(table_splits) if len(split) > 0}
+
+            with tqdm(total=len(futures), desc="Processing Tables", unit="batch") as pbar:
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result is not None:
+                        g_e, g_f, o_e, o_f, e_var, f_var = result
                         np.add(gram_e, g_e, out=gram_e)
                         np.add(gram_f, g_f, out=gram_f)
                         np.add(ord_e, o_e, out=ord_e)
                         np.add(ord_f, o_f, out=ord_f)
-                        print("right afte r+=")
-                        print_mem()
-                        e_variance.update_manual(local_e_var.mean, local_e_var.std, local_e_var.n)
-                        f_variance.update_manual(local_f_var.mean, local_f_var.std, local_f_var.n)
 
-                        del g_e, g_f, o_e, o_f, local_e_var, local_f_var, result  # drop ref early
-                        print("after del")
-                        print_mem()
+                        e_variance.update_manual(e_var.mean, e_var.std, e_var.n)
+                        f_variance.update_manual(f_var.mean, f_var.std, f_var.n)
+
+                    pbar.update()
 
         energy_weight, force_weight = calc_E_F_weights(
             e_variance.n, f_variance.n,
@@ -864,6 +918,8 @@ class WeightedLinearModel(BasicLinearModel):
         )
 
         self.fit_with_gram(gram, ordinate)
+
+
 
     def initialize_gram_ordinate(self):
         """Initialize empty matrices for gram matrices and ordinates."""
@@ -903,6 +959,8 @@ class WeightedLinearModel(BasicLinearModel):
                                                  n_elements=n_elements,
                                                  energy_key=energy_key,
                                                  sample_weights=sample_weights)
+        if len(x_e) == 0 or len(x_f) == 0:
+            return None
         x_e, y_e = freeze_columns(x_e,
                                   y_e,
                                   self.mask,
