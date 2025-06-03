@@ -546,10 +546,16 @@ def save_feature_db(dataframe, filename, table_name='features'):
         table_name (str): default "features".
     """
     dataframe.to_hdf(filename, table_name, mode="a", format='fixed')
+import psutil, os
+import time
 
+def print_mem():
+    process = psutil.Process(os.getpid())
+    print(f"RSS Memory: {process.memory_info().rss / 1e6:.2f} MB")
 
 def load_feature_db(filename, table_name=None, keys=None):
     dataframe = pd.read_hdf(filename, table_name)
+    print_mem()
     if keys is not None:
         table_keys = dataframe.index.unique(level=0)
         matching_keys = table_keys.intersection(keys)
