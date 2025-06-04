@@ -957,6 +957,7 @@ class WeightedLinearModel(BasicLinearModel):
             return _apply_cur(self, pd.concat(dfs, axis=0, copy=False))
         else:
             return pd.concat(dfs, axis=0, copy=False)
+    
     def fit_from_dataframe_parallel(
         self,
         df: pd.DataFrame,
@@ -967,11 +968,32 @@ class WeightedLinearModel(BasicLinearModel):
         energy_key: str = "energy",
         num_cores: int = 2,
         progress: str = "bar",
+        exclude_elements: List[str] = None
     ):
         """
         Identical to `fit_from_files_parallel`, except that the data are
         already in memory.
         """
+        if exclude_elements is not None:
+            sizes, offsets = self.bspline_config.get_interaction_partitions()
+            col_idx = []
+            frozen_c = []
+
+            for interaction in sizes:
+                if any(el in interaction for el in exclude_elements):
+                    offset = offsets[interaction]
+                    size = sizes[interaction]
+                    col_idx.extend(range(offset, offset + size))
+                    frozen_c.extend([0.0] * size)
+
+            self.bspline_config.col_idx = np.array(col_idx, dtype=int)
+            self.bspline_config.frozen_c = np.array(frozen_c, dtype=float)
+
+            drop_columns = [
+                col for col in df.columns
+                if any(el.lower() in col.lower() for el in exclude_elements)
+            ]
+            df.drop(columns=drop_columns, inplace=True)
         # ---------------------------------------------------------------------
         gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
         e_var, f_var = VarianceRecorder(), VarianceRecorder()
@@ -1139,7 +1161,8 @@ class WeightedLinearModel(BasicLinearModel):
                         keys: List[str] = None,
                         table_names: List[str] = None,
                         score: bool = True,
-                        drop_columns: List[str] = None):
+                        drop_columns: List[str] = None,
+                        use_elements: List[str] = None):
         """
         Extract inputs and outputs from HDF5 file and predict energies/forces.
 
@@ -1167,7 +1190,8 @@ class WeightedLinearModel(BasicLinearModel):
                                                 table_names=table_names,
                                                 subset_keys=keys,
                                                 n_elements=n_elements,
-                                                drop_columns=drop_columns)
+                                                drop_columns=drop_columns,
+                                                use_elements=use_elements)
         if score:
             rmse_e = rmse_metric(y_e, p_e)
             rmse_f = rmse_metric(y_f, p_f)
@@ -1182,7 +1206,8 @@ class WeightedLinearModel(BasicLinearModel):
                         keys: List[str] = None,
                         table_names: List[str] = None,
                         score: bool = True,
-                        drop_columns: List[str] = None):
+                        drop_columns: List[str] = None,
+                        use_elements: List[str] = None):
         """
         Extract inputs and outputs from HDF5 file and predict energies/forces.
 
@@ -1210,7 +1235,8 @@ class WeightedLinearModel(BasicLinearModel):
                                                 table_names=table_names,
                                                 subset_keys=keys,
                                                 n_elements=n_elements,
-                                                drop_columns=drop_columns)
+                                                drop_columns=drop_columns,
+                                                use_elements=use_elements)
         if score:
             rmse_e = rmse_metric(y_e, p_e)
             rmse_f = rmse_metric(y_f, p_f)
@@ -1791,7 +1817,14 @@ def subset_prediction(df: pd.DataFrame,
     ids = df.index.unique(level=0)
 
     return y_e, p_e, y_f, p_f, list(ids), list(force_labels)
-
+def get_elements_in_feature_data(feature_data):
+    columns = feature_data.columns
+    elements = set()
+    for col in columns:
+        if col.startswith('n_'):
+            element = col.split('_')[1]
+            elements.add(element)
+    return elements
 
 def batched_prediction_multiple_files(
     model: WeightedLinearModel,
@@ -1799,6 +1832,7 @@ def batched_prediction_multiple_files(
     table_names: Collection = None,
     subset_keys: Collection = None,
     drop_columns: List[str] = None,
+    use_elements: List[str] = None,
     **kwargs
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -1839,9 +1873,18 @@ def batched_prediction_multiple_files(
 
     # Load DataFrame batches and process predictions
     for df in dataframe_batch_loader_multiple_files(filenames, table_names):
+        drop_columns_final = []
+        if use_elements is not None:
+            elements_in_data = get_elements_in_feature_data(df)
+            exclude_elements = [el for el in elements_in_data if el not in use_elements]
+            drop_columns_final = [
+                col for col in df.columns
+                if any(ex_el.lower() in col.lower() for ex_el in exclude_elements)
+            ]
         if drop_columns:
-            df.drop(columns=drop_columns, inplace=True)
-        
+            drop_columns_final = drop_columns_final.extend(drop_columns) if drop_columns_final else drop_columns
+        if drop_columns_final:
+            df.drop(columns=drop_columns_final, inplace=True)
         # Perform predictions using the fitted model
         results = subset_prediction(df, model, subset_keys=subset_keys, **kwargs)
         
@@ -1861,6 +1904,7 @@ def batched_prediction(model: WeightedLinearModel,
                        table_names: Collection = None,
                        subset_keys: Collection = None,
                        drop_columns: List[str] = None,
+                       use_elements: List[str] = None,
                        **kwargs) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list, list]:
     """
     Convenience function for optimization workflow. Read inputs/outputs
@@ -1879,8 +1923,19 @@ def batched_prediction(model: WeightedLinearModel,
     y_e, p_e, y_f, p_f, ids,force_ids = [], [], [], [], [],[]
 
     for df in df_batches:
-        if drop_columns is not None:
-            df.drop(columns=drop_columns, inplace=True)
+        drop_columns_final = None
+        if use_elements is not None:
+            elements_in_data = get_elements_in_feature_data(df)
+            exclude_elements = [el for el in elements_in_data if el not in use_elements]
+
+            drop_columns_final = [
+                col for col in df.columns
+                if any(ex_el.lower() in col.lower() for ex_el in exclude_elements)
+            ]
+        if drop_columns:
+            drop_columns_final = drop_columns + drop_columns_final
+        if drop_columns_final:
+            df.drop(columns=drop_columns_final, inplace=True)
 
         results = subset_prediction(df, model, subset_keys=subset_keys, **kwargs)
         y_e.extend(results[0])
