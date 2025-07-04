@@ -216,21 +216,25 @@ class WeightedLinearModel(BasicLinearModel):
         return WeightedLinearModel.from_dict(config)
 
     @staticmethod
-    def from_dict(config):
-        bspline_config = bspline.BSplineBasis.from_dict(config)
+    def from_dict(config, bspline_config=None):
+        if bspline_config is None:
+            bspline_config = bspline.BSplineBasis.from_dict(config)
+        else:
+            bspline_config = bspline_config
         regularizer = config.get("regularizer", None)
         data_coverage = config.get("data_coverage", None)
         model = WeightedLinearModel(bspline_config,
                                     regularizer=regularizer,
                                     data_coverage=data_coverage)
-        model.load(solution=config)
+        model.load(solution=config, bspline_config=bspline_config)
         return model
 
     @staticmethod
-    def from_json(filename):
+    def from_json(filename, bspline_config=None):
         """Load model (coefficients and knots map) from json file."""
         dump = json_io.load_interaction_map(filename)
-        return WeightedLinearModel.from_dict(dump)
+        return WeightedLinearModel.from_dict(dump, bspline_config=bspline_config)
+    
 
     def as_dict(self):
         solution = arrange_coefficients(self.coefficients, self.bspline_config)
@@ -290,6 +294,7 @@ class WeightedLinearModel(BasicLinearModel):
                                                    self.frozen_c,
                                                    self.col_idx)
         self.data_coverage = np.logical_or(self.data_coverage, data_coverage)
+
         regularizer = freeze_regularizer(self.regularizer, self.mask)
         regularizer = np.dot(regularizer.T, regularizer)
         coefficients = lu_factorization(gram + regularizer, ordinate)
@@ -473,7 +478,7 @@ class WeightedLinearModel(BasicLinearModel):
         return gram_e, gram_f, ordinate_e, ordinate_f, local_e_variance, local_f_variance
     
     @staticmethod
-    def process_keys(df, keys, batch_size, sample_weights, energy_key, model_instance):
+    def process_keys(df, keys, batch_size, sample_weights, energy_key, model_instance,outlier_config: Dict = None):
         # local vars for each thread
         local_e_variance = VarianceRecorder()
         local_f_variance = VarianceRecorder()
@@ -484,7 +489,8 @@ class WeightedLinearModel(BasicLinearModel):
             f_variance=local_f_variance,
             sample_weights=sample_weights,
             energy_key=energy_key,
-            batch_size=batch_size
+            batch_size=batch_size,
+            outlier_config=outlier_config
         )
 
         gram_e = np.asarray(gram_e, dtype=np.float64)
@@ -957,23 +963,7 @@ class WeightedLinearModel(BasicLinearModel):
             return _apply_cur(self, pd.concat(dfs, axis=0, copy=False))
         else:
             return pd.concat(dfs, axis=0, copy=False)
-    
-    def fit_from_dataframe_parallel(
-        self,
-        df: pd.DataFrame,
-        subset: Collection,
-        weight: float = 0.5,
-        batch_size: int = 25_000,
-        sample_weights: Dict = None,
-        energy_key: str = "energy",
-        num_cores: int = 2,
-        progress: str = "bar",
-        exclude_elements: List[str] = None
-    ):
-        """
-        Identical to `fit_from_files_parallel`, except that the data are
-        already in memory.
-        """
+    def drop_excluded_columns(self, exclude_elements, df):
         if exclude_elements is not None:
             sizes, offsets = self.bspline_config.get_interaction_partitions()
             col_idx = []
@@ -994,6 +984,27 @@ class WeightedLinearModel(BasicLinearModel):
                 if any(el.lower() in col.lower() for el in exclude_elements)
             ]
             df.drop(columns=drop_columns, inplace=True)
+        return df
+    
+
+    def fit_from_dataframe_parallel(
+        self,
+        df: pd.DataFrame,
+        subset: Collection,
+        weight: float = 0.5,
+        batch_size: int = 25_000,
+        sample_weights: Dict = None,
+        energy_key: str = "energy",
+        num_cores: int = 2,
+        progress: str = "bar",
+        exclude_elements: List[str] = None,
+        outlier_config: Dict = None
+    ):
+        """
+        Identical to `fit_from_files_parallel`, except that the data are
+        already in memory.
+        """
+        df = self.drop_excluded_columns(exclude_elements, df)
         # ---------------------------------------------------------------------
         gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
         e_var, f_var = VarianceRecorder(), VarianceRecorder()
@@ -1010,7 +1021,7 @@ class WeightedLinearModel(BasicLinearModel):
             keys = chunk.index.unique(level=0)
             out = WeightedLinearModel.process_keys(
                 chunk, keys, batch_size,
-                sample_weights, energy_key, self
+                sample_weights, energy_key, self, outlier_config
             )
             if out is None:
                 return
@@ -1092,17 +1103,75 @@ class WeightedLinearModel(BasicLinearModel):
             progress=progress
         )
 
+    def fine_tune_from_dataframe_blend(
+        self,
+        df: pd.DataFrame,
+        subset: Collection,
+        alpha: float = 0.1,
+        weight: float = 0.5,
+        batch_size: int = 25000,
+        sample_weights: Dict = None,
+        energy_key: str = "energy",
+        num_cores: int = 2,
+        progress: str = "bar",
+        exclude_elements: List[str] = None
+    ):
+        
+        if self.coefficients is None:
+            raise RuntimeError("Model must be fit before fine-tuning.")
+        if not (0.0 <= alpha <= 1.0):
+            raise ValueError("alpha must be between 0 and 1")
+        df = self.drop_excluded_columns(exclude_elements, df)
+        gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
+        e_var, f_var = VarianceRecorder(), VarianceRecorder()
 
-    def initialize_gram_ordinate(self):
-        """Initialize empty matrices for gram matrices and ordinates."""
-        n_columns = self.n_feats - len(self.col_idx)
-        print(f'n_columns: {n_columns} | nfeats: {self.n_feats} | col_idx: {self.col_idx}')
-        gram_e = np.zeros((n_columns, n_columns))
-        ord_e = np.zeros(n_columns)
-        gram_f = np.zeros((n_columns, n_columns))
-        ord_f = np.zeros(n_columns)
-        return gram_e, gram_f, ord_e, ord_f
+        idx_splits = np.array_split(np.arange(len(df)), max(1, num_cores))
+        data_splits = [df.iloc[idx] for idx in idx_splits]
+        lock = threading.Lock()
 
+        def _process(chunk):
+            if chunk.empty:
+                return
+            keys = chunk.index.unique(level=0)
+            result = WeightedLinearModel.process_keys(
+                chunk, keys, batch_size,
+                sample_weights, energy_key, self
+            )
+            if result is None:
+                return
+            g_e, g_f, o_e, o_f, ev, fv = result
+            with lock:
+                np.add(gram_e, g_e, out=gram_e)
+                np.add(gram_f, g_f, out=gram_f)
+                np.add(ord_e, o_e, out=ord_e)
+                np.add(ord_f, o_f, out=ord_f)
+                e_var.update_manual(ev.mean, ev.std, ev.n)
+                f_var.update_manual(fv.mean, fv.std, fv.n)
+
+        with ThreadPoolExecutor(max_workers=max(1, num_cores)) as ex:
+            futs = [ex.submit(_process, chunk) for chunk in data_splits]
+            if progress == "bar":
+                pbar = tqdm(total=len(futs), desc="Fine-tuning", unit="batch")
+            for fut in as_completed(futs):
+                fut.result()
+                if progress == "bar":
+                    pbar.update()
+            if progress == "bar":
+                pbar.close()
+
+        e_w, f_w = calc_E_F_weights(e_var.n, f_var.n, e_var.std, f_var.std)
+        gram, ordinate = self.combine_weighted_gram(
+            gram_e, gram_f, ord_e, ord_f, e_w, f_w, weight
+        )
+
+        regularizer = freeze_regularizer(self.regularizer, self.mask)
+        regularizer = np.dot(regularizer.T, regularizer)
+        coeff_update = lu_factorization(gram + regularizer, ordinate)
+        coeff_update = revert_frozen_coefficients(
+            coeff_update, self.n_feats, self.mask, self.frozen_c, self.col_idx
+        )
+
+        self.coefficients = (1 - alpha) * self.coefficients + alpha * coeff_update
     def gram_from_df(self,
                      df: pd.DataFrame,
                      keys: Collection,
@@ -1110,7 +1179,8 @@ class WeightedLinearModel(BasicLinearModel):
                      f_variance: VarianceRecorder = None,
                      sample_weights: Dict = None,
                      energy_key: str = "energy",
-                     batch_size: int = 2500):
+                     batch_size: int = 2500,
+                     outlier_config: Dict = None):
         """
         Extract inputs and outputs from dataframe and compute
         moore-penrose components (gram matrices and ordinates).
@@ -1259,6 +1329,7 @@ class WeightedLinearModel(BasicLinearModel):
     def load(self,
              solution: Dict = None,
              filename: str = None,
+             bspline_config: bspline.BSplineBasis = None
              ):
         """
         Reflatten coefficients (e.g. obtained through arrange_coefficients)
@@ -1273,6 +1344,9 @@ class WeightedLinearModel(BasicLinearModel):
             if solution is not None:
                 warnings.warn("Provided solutions ignored; loading file.")
             solution = json_io.load_interaction_map(filename)
+        # if bspline_config is not None:
+        #     self.bspline_config = bspline_config
+        #     self.n_basis = np.sum(self.bspline_config.get_feature_partition_sizes())
         elif solution is None:
             raise ValueError("Neither solution nor filename were provided.")
         if "coefficients" in solution:
@@ -1286,6 +1360,14 @@ class WeightedLinearModel(BasicLinearModel):
                 sorted_key = composition.sort_interaction_symbols(key)
                 if sorted_key != key:
                     solution[sorted_key] = solution[key]
+        for trio in self.bspline_config.interactions_map.get(3, []):
+            r_min = self.bspline_config.r_min_map[trio]
+            r_max = self.bspline_config.r_max_map[trio]
+            res = self.bspline_config.resolution_map[trio]
+            self.bspline_config.symmetry[trio] = bspline.find_symmetry_3B(trio, r_min, r_max, res)
+            print(f'Symmetry for {trio} set to {self.bspline_config.symmetry[trio]}')
+
+        self.bspline_config.update_basis_functions()
         # consistency check with bspline_config
         component_len = self.bspline_config.get_interaction_partitions()[0]
         for pair in self.bspline_config.interactions_map[2]:
@@ -1300,21 +1382,28 @@ class WeightedLinearModel(BasicLinearModel):
                 )
         for trio in self.bspline_config.interactions_map.get(3, []):
             n_target = component_len[trio]
+            print(f"Checking trio {trio} with target size {n_target}")
             if trio not in solution:
                 warnings.warn(f"{trio} not provided.")
             if trio in solution:
                 # decompress if necessary
                 component = np.array(solution[trio])
                 if len(np.shape(component)) > 1:
+                    print("model load compressing")
                     vector = self.bspline_config.compress_3B(component,
                                                              trio,
                                                              fitting = False)
                     solution[trio] = vector
             n_provided = len(solution[trio])
             if n_provided != n_target:
-                raise ValueError(
-                    f"Incorrect shape: {trio}, {n_provided} != {n_target}"
-                )
+                print("nprovided != n_target")
+                print(f"Provided: {n_provided}, target: {n_target}")
+                component_len = self.bspline_config.get_interaction_partitions(uncompressed=True)[0]
+                n_target = component_len[trio]
+                if n_provided != n_target:
+                    raise ValueError(
+                        f"Incorrect shape: {trio}, {n_provided} != {n_target}"
+                    )
         flattened_coefficients = []
         for element in self.bspline_config.element_list:
             value = solution[element]
@@ -1376,6 +1465,16 @@ class WeightedLinearModel(BasicLinearModel):
             self.initialize_gram_ordinate()
         self._acc_e_variance = VarianceRecorder()
         self._acc_f_variance = VarianceRecorder()
+    
+    def initialize_gram_ordinate(self):
+        """Initialize empty matrices for gram matrices and ordinates."""
+        n_columns = self.n_feats - len(self.col_idx)
+        print(f'n_columns: {n_columns} | nfeats: {self.n_feats} | col_idx: {self.col_idx}')
+        gram_e = np.zeros((n_columns, n_columns))
+        ord_e = np.zeros(n_columns)
+        gram_f = np.zeros((n_columns, n_columns))
+        ord_f = np.zeros(n_columns)
+        return gram_e, gram_f, ord_e, ord_f
 
     def accumulate_gram_from_file(self,
                                   filename: str,
@@ -1997,7 +2096,6 @@ def arrange_coefficients(coefficients, bspline_config):
     solutions = {element: value[0] for element, value
                  in zip(element_list, solutions_list[:len(element_list)])}
     solutions_list = solutions_list[len(element_list):]
-
     j = 0
     for d in range(2, bspline_config.degree + 1):
         interactions_map = bspline_config.interactions_map[d]
@@ -2111,3 +2209,125 @@ def calc_E_F_weights(n_e, n_f, std_e, std_f):
     return energy_weight, force_weight
 
     
+def filter_residual_zscore(x, y, coeffs, std, threshold=4.0):
+        if coeffs is None or std == 0:
+            return x, y  # nothing to compare against
+
+        residuals = y - np.dot(x, coeffs)
+        z_scores = np.abs(residuals / (std + 1e-8))
+        mask = z_scores < threshold
+        return x[mask], y[mask]
+def filter_mahalanobis(x, y=None, *, threshold=4.0):
+    if len(x) < 2:
+        return (x, y) if y is not None else x
+
+    mean = np.mean(x, axis=0)
+    cov = np.cov(x, rowvar=False)
+    try:
+        inv_cov = np.linalg.inv(cov + np.eye(cov.shape[0]) * 1e-6)
+    except np.linalg.LinAlgError:
+        return (x, y) if y is not None else x
+
+    diffs = x - mean
+    dists = np.sqrt(np.sum(diffs @ inv_cov * diffs, axis=1))
+    mask = dists < threshold
+    return (x[mask], y[mask]) if y is not None else x[mask]
+def filter_by_feature_norm(x, y, threshold=4.0, bins=20):
+    norms = np.linalg.norm(x, axis=1)
+    bins_idx = np.digitize(norms, np.linspace(norms.min(), norms.max(), bins))
+
+    keep_mask = np.ones(len(y), dtype=bool)
+
+    for b in np.unique(bins_idx):
+        idx = (bins_idx == b)
+        if np.sum(idx) < 5:
+            continue
+        y_bin = y[idx]
+        mu, std = np.mean(y_bin), np.std(y_bin)
+        z = np.abs((y_bin - mu) / (std + 1e-8))
+        keep_mask[idx] = z < threshold
+
+    return x[keep_mask], y[keep_mask]
+
+def remove_bad_features(x, y):
+    mask = np.isfinite(x).all(axis=1)
+    return x[mask], y[mask]
+from sklearn.neighbors import NearestNeighbors
+import numpy as np
+
+def filter_global_percentile(X, y, lower=0.1, upper=99.9):
+    lo, hi = np.percentile(y, [lower, upper])
+    mask = (y >= lo) & (y <= hi)
+    return X[mask], y[mask]
+
+def filter_global_iqr(X, y, k=1.5):
+    q1, q3 = np.percentile(y, [25, 75])
+    iqr = q3 - q1
+    lo, hi = q1 - k * iqr, q3 + k * iqr
+    mask = (y >= lo) & (y <= hi)
+    return X[mask], y[mask]
+
+def filter_residual_zscore(X, y, coeffs, std=None, threshold=4.0):
+    if coeffs is None:
+        return X, y
+    residual = y - np.dot(X, coeffs)
+    std = std if std is not None else np.std(residual)
+    z = np.abs(residual / (std + 1e-8))
+    mask = z < threshold
+    return X[mask], y[mask]
+
+def filter_mahalanobis(X, y, threshold=4.0):
+    mu = np.mean(X, axis=0)
+    cov = np.cov(X, rowvar=False)
+    try:
+        inv_cov = np.linalg.inv(cov + np.eye(cov.shape[0]) * 1e-6)
+    except np.linalg.LinAlgError:
+        return X, y
+    delta = X - mu
+    dist = np.sqrt(np.sum(delta @ inv_cov * delta, axis=1))
+    mask = dist < threshold
+    return X[mask], y[mask]
+
+def filter_feature_norm_vs_label(X, y, bins=30, threshold=4.0):
+    norms = np.linalg.norm(X, axis=1)
+    bin_idx = np.digitize(norms, np.linspace(norms.min(), norms.max(), bins))
+    mask = np.ones(len(y), dtype=bool)
+    for b in np.unique(bin_idx):
+        idx = (bin_idx == b)
+        if np.sum(idx) < 5:
+            continue
+        yb = y[idx]
+        mu, std = np.mean(yb), np.std(yb)
+        z = np.abs((yb - mu) / (std + 1e-8))
+        mask[idx] = z < threshold
+    return X[mask], y[mask]
+def apply_global_filters(X, y, coeffs=None, kind="energy", config=None):
+    if config is None:
+        config = {}
+
+    X, y = filter_global_percentile(X, y,
+        lower=config.get("percentile_lo", 0.1),
+        upper=config.get("percentile_hi", 99.9))
+
+    X, y = filter_global_iqr(X, y,
+        k=config.get("iqr_k", 1.5))
+
+    X, y = filter_mahalanobis(X, y,
+        threshold=config.get("mahalanobis_thresh", 5.0))
+
+    X, y = filter_feature_norm_vs_label(X, y,
+        bins=config.get("norm_bins", 30),
+        threshold=config.get("norm_dev_thresh", 4.0))
+
+    if coeffs is not None:
+        X, y = filter_residual_zscore(X, y, coeffs,
+            std=config.get("resid_std", None),
+            threshold=config.get("resid_thresh", 5.0))
+
+    return X, y
+def restore_feature_columns(X, full_dim):
+    if X.shape[1] == full_dim:
+        return X
+    X_full = np.zeros((X.shape[0], full_dim), dtype=X.dtype)
+    X_full[:, :X.shape[1]] = X
+    return X_full

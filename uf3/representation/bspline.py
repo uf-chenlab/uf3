@@ -102,6 +102,7 @@ class BSplineBasis:
                 try:
                     knots_json = json_io.load_interaction_map(knots_fname)
                     knots_map = knots_json["knots"]
+                    
                 except (ValueError, KeyError, IOError):
                     knots_map = None
                 basis_settings["knots_map"] = knots_map
@@ -319,7 +320,7 @@ class BSplineBasis:
             else:
                 warnings.warn(f"{trio} specification unused.")
 
-    def update_basis_functions(self):
+    def update_basis_functions(self, uncompressed=False):
         """"""
         # Generate subintervals and basis functions for two-body
         for pair in self.interactions_map.get(2, []):
@@ -361,7 +362,7 @@ class BSplineBasis:
                 self.knot_subintervals[trio] = subintervals
                 self.basis_functions[trio] = basis_functions
             self.set_flatten_template_3B()
-        self.partition_sizes = self.get_feature_partition_sizes()
+        self.partition_sizes = self.get_feature_partition_sizes(uncompressed=uncompressed)
         ci, cf = self.generate_frozen_indices(offset_1b=self.offset_1b,
                                               n_lead=self.leading_trim,
                                               n_trail=self.trailing_trim)
@@ -522,7 +523,7 @@ class BSplineBasis:
 
         return matrix
 
-    def get_feature_partition_sizes(self) -> List:
+    def get_feature_partition_sizes(self, uncompressed=False) -> List:
         """Get partition sizes: one-body, two-body, and three-body terms."""
         partition_sizes = [1] * len(self.chemical_system.element_list)
         for degree in range(2, self.chemical_system.degree + 1):
@@ -532,8 +533,15 @@ class BSplineBasis:
                     size = self.resolution_map[interaction] + 3
                     partition_sizes.append(size)
                 elif degree == 3:
-                    mask = np.where(self.flat_weights[interaction] > 0)[0]
-                    size = len(mask)
+                    if uncompressed:
+                        res = self.resolution_map[interaction]
+                        print("resolution: ", res)
+                        # pad each axis by 3
+                        full_res = tuple(r + 3 for r in res)
+                        size = np.prod(full_res)
+                    else:
+                        mask = np.where(self.flat_weights[interaction] > 0)[0]
+                        size = len(mask)
                     partition_sizes.append(size)
                 else:
                     raise ValueError(
@@ -541,7 +549,7 @@ class BSplineBasis:
         self.partition_sizes = partition_sizes
         return partition_sizes
 
-    def get_interaction_partitions(self):
+    def get_interaction_partitions(self, uncompressed=False):
         """
 
 
@@ -549,7 +557,7 @@ class BSplineBasis:
 
         """
         interactions_list = self.interactions
-        partition_sizes = self.get_feature_partition_sizes()
+        partition_sizes = self.get_feature_partition_sizes(uncompressed=uncompressed)
         offsets = np.cumsum(partition_sizes)
         offsets = np.insert(offsets, 0, 0)
         component_sizes = {}
@@ -740,7 +748,9 @@ def find_symmetry_3B(trio: Tuple,
 
     """ 
     # 2 neighboring elements are different
+    print("trio is: ", trio)
     if trio[1] != trio[2]:
+        print("trio[1] != trio[2]")
         return 1
     else:  # 2 neighboring elements are identical
 
@@ -749,6 +759,7 @@ def find_symmetry_3B(trio: Tuple,
             r_max,
             resolution
         ))
+        print("configs: ", configs)
 
         if configs[0] == configs[1] == configs[2]:
             if trio[0] == trio[1]:
