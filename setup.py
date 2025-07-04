@@ -47,6 +47,6 @@ if __name__ == "__main__":
             'Operating System :: OS Independent',
             'Topic :: Scientific/Engineering'
         ],
-        python_requires='>=3.9, <3.13',
+        python_requires='>=3.9, <3.14',
         tests_require=test_requires,
     )
