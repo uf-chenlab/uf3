@@ -9,15 +9,27 @@ from uf3.data import io
 from uf3.data import composition
 from uf3.util import json_io
 from uf3.util import parallel
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from concurrent.futures import as_completed
 from tqdm import tqdm
 import gc
 import psutil, os
 from sklearn.utils.extmath import randomized_svd
 import threading
+import multiprocessing
+from queue import Queue
 import time
-
+import joblib
+from joblib import Parallel, delayed
+def log_total_memory(label=""):
+    parent = psutil.Process(os.getpid())
+    mem = parent.memory_info().rss
+    for child in parent.children(recursive=True):
+        try:
+            mem += child.memory_info().rss
+        except psutil.NoSuchProcess:
+            continue
+    print(f"[MEMORY] {label} | Total RSS: {mem / 1024 ** 2:.2f} MB")
 def print_mem():
     process = psutil.Process(os.getpid())
     print(f"RSS Memory: {process.memory_info().rss / 1e6:.2f} MB")
@@ -395,7 +407,7 @@ class WeightedLinearModel(BasicLinearModel):
                             sample_weights,
                             energy_key,
                             model_instance,
-                            chunk_size=250000):
+                            chunk_size=25000):
         table_name = table_names[j]
         filename = filenames_list[j]
 
@@ -476,7 +488,29 @@ class WeightedLinearModel(BasicLinearModel):
         ordinate_f = np.asarray(ordinate_f, dtype=np.float64)
 
         return gram_e, gram_f, ordinate_e, ordinate_f, local_e_variance, local_f_variance
-    
+    @staticmethod
+    def process_keys_stream(df, keys, batch_size, sample_weights, energy_key, model_instance, outlier_config: Dict = None):
+        local_e_variance = VarianceRecorder()
+        local_f_variance = VarianceRecorder()
+
+        gram_e, gram_f, ordinate_e, ordinate_f = model_instance.streamed_gram_from_df(
+            df, keys,
+            e_variance=local_e_variance,
+            f_variance=local_f_variance,
+            sample_weights=sample_weights,
+            energy_key=energy_key,
+            batch_size=batch_size,
+            outlier_config=outlier_config
+        )
+
+        return (
+            np.asarray(gram_e, dtype=np.float64),
+            np.asarray(gram_f, dtype=np.float64),
+            np.asarray(ordinate_e, dtype=np.float64),
+            np.asarray(ordinate_f, dtype=np.float64),
+            local_e_variance,
+            local_f_variance
+        )
     @staticmethod
     def process_keys(df, keys, batch_size, sample_weights, energy_key, model_instance,outlier_config: Dict = None):
         # local vars for each thread
@@ -497,14 +531,13 @@ class WeightedLinearModel(BasicLinearModel):
         gram_f = np.asarray(gram_f, dtype=np.float64)
         ordinate_e = np.asarray(ordinate_e, dtype=np.float64)
         ordinate_f = np.asarray(ordinate_f, dtype=np.float64)
-
         return gram_e, gram_f, ordinate_e, ordinate_f, local_e_variance, local_f_variance
 
     def fit_from_file_parallel(self,
                            filename: str,
                            subset: Collection,
                            weight: float = 0.5,
-                           batch_size=25000,
+                           batch_size=500,
                            sample_weights: Dict = None,
                            energy_key="energy",
                            num_cores=1,
@@ -986,13 +1019,13 @@ class WeightedLinearModel(BasicLinearModel):
             df.drop(columns=drop_columns, inplace=True)
         return df
     
-
+    
     def fit_from_dataframe_parallel(
         self,
         df: pd.DataFrame,
         subset: Collection,
         weight: float = 0.5,
-        batch_size: int = 25_000,
+        batch_size: int = 1000,
         sample_weights: Dict = None,
         energy_key: str = "energy",
         num_cores: int = 2,
@@ -1004,49 +1037,75 @@ class WeightedLinearModel(BasicLinearModel):
         Identical to `fit_from_files_parallel`, except that the data are
         already in memory.
         """
-        df = self.drop_excluded_columns(exclude_elements, df)
-        # ---------------------------------------------------------------------
+        import os
+        print("NumPy config:")
+        np.show_config()
+        print("OMP_NUM_THREADS:", os.environ.get("OMP_NUM_THREADS"))
+        print("MKL_NUM_THREADS:", os.environ.get("MKL_NUM_THREADS"))
+        from threadpoolctl import threadpool_info
+        import mkl
+        print("MKL threads:", mkl.get_max_threads())
+        for lib in threadpool_info():
+            print(f"{lib['internal_api']} | threads: {lib['num_threads']} | library: {lib['filepath']}")
+            df = self.drop_excluded_columns(exclude_elements, df)
         gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
         e_var, f_var = VarianceRecorder(), VarianceRecorder()
+        if(num_cores > 4):
+            os.environ["MKL_NUM_THREADS"] = "4"
+            os.environ["OMP_NUM_THREADS"] = "4"
+            num_cores = num_cores//4
+        idx = np.arange(len(df))
+        splits = np.array_split(idx, max(max(1, num_cores), len(idx)/30000))
+        
+        data_splits = [df.iloc[i].copy(deep=False) for i in splits]
+        del df
+        model_config = {
+            "mask": self.mask,
+            "frozen_c": self.frozen_c,
+            "col_idx": self.col_idx,
+            "n_elements": len(self.bspline_config.element_list)
+        }
 
-        # split the dataframe *view* for processing
-        idx_splits = np.array_split(np.arange(len(df)), max(1, num_cores))
-        data_splits = [df.iloc[idx] for idx in idx_splits]
+        print("cpu count: ", multiprocessing.cpu_count())
+        log_total_memory("Before parallel processing")
 
-        lock = threading.Lock()
+        # break data_splits into batches of size num_cores
+        for i in range(0, len(data_splits), num_cores):
+            batch = data_splits[i:i + num_cores]
 
-        def _process(chunk):
-            if chunk.empty:
-                return
-            keys = chunk.index.unique(level=0)
-            out = WeightedLinearModel.process_keys(
-                chunk, keys, batch_size,
-                sample_weights, energy_key, self, outlier_config
+            results = joblib.Parallel(n_jobs=num_cores, backend="loky")(
+                joblib.delayed(process_chunk_serializable)(
+                    chunk,
+                    model_config,
+                    energy_key,
+                    batch_size,
+                    sample_weights,
+                    outlier_config
+                ) for chunk in tqdm(batch, desc=f"Processing batch {i//num_cores + 1}", unit="chunk", disable=(progress != "bar"))
             )
-            if out is None:
-                return
-            g_e, g_f, o_e, o_f, ev, fv = out
-            with lock:
+
+            log_total_memory("After batch parallel processing")
+
+            for result in results:
+                if result is None:
+                    continue
+                g_e, g_f, o_e, o_f, e_mean, e_std, e_n, f_mean, f_std, f_n = result
+
                 np.add(gram_e, g_e, out=gram_e)
                 np.add(gram_f, g_f, out=gram_f)
                 np.add(ord_e, o_e, out=ord_e)
                 np.add(ord_f, o_f, out=ord_f)
-                e_var.update_manual(ev.mean, ev.std, ev.n)
-                f_var.update_manual(fv.mean, fv.std, fv.n)
+                e_var.update_manual(e_mean, e_std, e_n)
+                f_var.update_manual(f_mean, f_std, f_n)
 
-        with ThreadPoolExecutor(max_workers=max(1, num_cores)) as ex, \
-             tqdm(total=len(data_splits), desc="Processing batches", unit="batch",
-                  disable=(progress != "bar")) as pbar:
-            futs = [ex.submit(_process, c) for c in data_splits]
-            for fut in as_completed(futs):
-                fut.result(); pbar.update()
+                del g_e, g_f, o_e, o_f, e_mean, e_std, e_n, f_mean, f_std, f_n
+
+            gc.collect()
 
         e_w, f_w = calc_E_F_weights(e_var.n, f_var.n, e_var.std, f_var.std)
-        gram, ord_ = self.combine_weighted_gram(
-            gram_e, gram_f, ord_e, ord_f,
-            e_w, f_w, weight
-        )
+        gram, ord_ = self.combine_weighted_gram(gram_e, gram_f, ord_e, ord_f, e_w, f_w, weight)
         self.fit_with_gram(gram, ord_)
+
     def fit_by_interaction(self,
                                          filenames: List[str],
                                          subset: Collection,
@@ -1179,7 +1238,7 @@ class WeightedLinearModel(BasicLinearModel):
                      f_variance: VarianceRecorder = None,
                      sample_weights: Dict = None,
                      energy_key: str = "energy",
-                     batch_size: int = 2500,
+                     batch_size: int = 500,
                      outlier_config: Dict = None):
         """
         Extract inputs and outputs from dataframe and compute
@@ -1198,12 +1257,16 @@ class WeightedLinearModel(BasicLinearModel):
                 operations in constructing gram matrices.
         """
         n_elements = len(self.bspline_config.element_list)
+        print("enter gram from df")
+        print_mem()
         x_e, y_e, x_f, y_f = dataframe_to_tuples(df,
                                                  n_elements=n_elements,
                                                  energy_key=energy_key,
                                                  sample_weights=sample_weights)
         if len(x_e) == 0 or len(x_f) == 0:
             return None
+        print("dataframe to tuples complete")
+        print_mem()
         x_e, y_e = freeze_columns(x_e,
                                   y_e,
                                   self.mask,
@@ -1217,12 +1280,15 @@ class WeightedLinearModel(BasicLinearModel):
         if e_variance is not None and f_variance is not None:
             e_variance.update(y_e)
             f_variance.update(y_f)
+        print("columns frozen")
+        print_mem()
         gram_e, ordinate_e = batched_moore_penrose(x_e,
                                                    y_e,
                                                    batch_size=batch_size)
         gram_f, ordinate_f = batched_moore_penrose(x_f,
                                                    y_f,
                                                    batch_size=batch_size)
+        print("batched moore penrose complete")
         return gram_e, gram_f, ordinate_e, ordinate_f
 
 
@@ -1470,10 +1536,10 @@ class WeightedLinearModel(BasicLinearModel):
         """Initialize empty matrices for gram matrices and ordinates."""
         n_columns = self.n_feats - len(self.col_idx)
         print(f'n_columns: {n_columns} | nfeats: {self.n_feats} | col_idx: {self.col_idx}')
-        gram_e = np.zeros((n_columns, n_columns))
-        ord_e = np.zeros(n_columns)
-        gram_f = np.zeros((n_columns, n_columns))
-        ord_f = np.zeros(n_columns)
+        gram_e = np.zeros((n_columns, n_columns),dtype=np.float64)
+        ord_e = np.zeros(n_columns,dtype=np.float64)
+        gram_f = np.zeros((n_columns, n_columns),dtype=np.float64)
+        ord_f = np.zeros(n_columns,dtype=np.float64)
         return gram_e, gram_f, ord_e, ord_f
 
     def accumulate_gram_from_file(self,
@@ -1548,8 +1614,138 @@ class WeightedLinearModel(BasicLinearModel):
             energy_weight, force_weight, weight
         )
         self.fit_with_gram(gram, ordinate)
+    
 
+    def streamed_gram_from_df(self,
+                          df: pd.DataFrame,
+                          keys: Collection,
+                          e_variance: VarianceRecorder = None,
+                          f_variance: VarianceRecorder = None,
+                          sample_weights: Dict = None,
+                          energy_key: str = "energy",
+                          batch_size: int = 500,
+                          outlier_config: Dict = None,
+                          float_dtype: np.dtype = np.float64):
+        """
+        Memory-efficient streamed gram matrix computation.
+        No full x/y matrices are built.
+        """
+        df = df.loc[keys]
+        n_elements = len(self.bspline_config.element_list)
+        n_features = self.n_feats - len(self.col_idx)  # exclude target column
 
+        gram_e = np.zeros((n_features, n_features), dtype=float_dtype)
+        ord_e = np.zeros(n_features, dtype=float_dtype)
+        gram_f = np.zeros((n_features, n_features), dtype=float_dtype)
+        ord_f = np.zeros(n_features, dtype=float_dtype)
+
+        # Accumulators
+        x_e_batch, y_e_batch = [], []
+        x_f_batch, y_f_batch = [], []
+
+        for is_energy, x, y in stream_dataframe_rows(df, energy_key, sample_weights, n_elements):
+            if is_energy:
+                x_e_batch.append(x)
+                y_e_batch.append(y)
+            else:
+                x_f_batch.append(x)
+                y_f_batch.append(y)
+
+            # Process when batch is full
+            if len(x_e_batch) >= batch_size:
+                X = np.stack(x_e_batch)
+                Y = np.stack(y_e_batch)
+                X, Y = freeze_columns(X, Y, self.mask, self.frozen_c, self.col_idx)
+                gram_e += X.T @ X
+                ord_e += X.T @ Y
+                if e_variance:
+                    e_variance.update(Y)
+                x_e_batch.clear()
+                y_e_batch.clear()
+
+            if len(x_f_batch) >= batch_size:
+                X = np.stack(x_f_batch)
+                Y = np.stack(y_f_batch)
+                X, Y = freeze_columns(X, Y, self.mask, self.frozen_c, self.col_idx)
+                gram_f += X.T @ X
+                ord_f += X.T @ Y
+                if f_variance:
+                    f_variance.update(Y)
+                x_f_batch.clear()
+                y_f_batch.clear()
+
+        # Final partials
+        if x_e_batch:
+            X = np.stack(x_e_batch)
+            Y = np.stack(y_e_batch)
+            X, Y = freeze_columns(X, Y, self.mask, self.frozen_c, self.col_idx)
+            gram_e += X.T @ X
+            ord_e += X.T @ Y
+            if e_variance:
+                e_variance.update(Y)
+
+        if x_f_batch:
+            X = np.stack(x_f_batch)
+            Y = np.stack(y_f_batch)
+            X, Y = freeze_columns(X, Y, self.mask, self.frozen_c, self.col_idx)
+            gram_f += X.T @ X
+            ord_f += X.T @ Y
+            if f_variance:
+                f_variance.update(Y)
+
+        return gram_e, gram_f, ord_e, ord_f
+    
+def test_chunk(x):
+    import time
+    print(f'starting process {os.getpid()}')
+    time.sleep(5)
+    return x
+def stream_dataframe_rows(
+        df: pd.DataFrame,
+        energy_key: str = "energy",
+        sample_weights: Dict = None,
+        n_elements: int = 0
+    ):
+        """
+        Yields one row at a time as (name, is_energy, x, y) with optional weight/normalization.
+        """
+        for (name, index), row in df.iterrows():
+            y = row.iloc[0]
+            x = row.iloc[1:].to_numpy()
+
+            # size normalization (assumes n_*)
+            if n_elements > 0 and index == energy_key:
+                norm = np.sum(x[:n_elements])
+                if norm != 0:
+                    x = x / norm
+                    y = y / norm
+
+            w = sample_weights.get(name, 1.0) if sample_weights else 1.0
+            x = x * w
+            y = y * w
+
+            is_energy = (index == energy_key)
+            yield is_energy, x.astype(np.float64, copy=False), np.float64(y)
+from joblib import Parallel, delayed
+def process_chunk_serializable_wrapper(args):
+    return process_chunk_serializable(*args)
+def process_chunk_serializable(chunk_df, model_config, energy_key, batch_size, sample_weights, outlier_config):
+    print("starting chunk process")
+    x_e, y_e, x_f, y_f = dataframe_to_tuples(chunk_df, model_config["n_elements"], energy_key, sample_weights)
+    del chunk_df
+    x_e, y_e = freeze_columns(x_e, y_e, model_config["mask"], model_config["frozen_c"], model_config["col_idx"])
+    x_f, y_f = freeze_columns(x_f, y_f, model_config["mask"], model_config["frozen_c"], model_config["col_idx"])
+
+    gram_e, ord_e = batched_moore_penrose(x_e, y_e, batch_size)
+    gram_f, ord_f = batched_moore_penrose(x_f, y_f, batch_size)
+    del x_e, x_f
+    
+    ev, fv = VarianceRecorder(), VarianceRecorder()
+    ev.update(y_e)
+    fv.update(y_f)
+    del y_e, y_f
+
+    return (gram_e, gram_f, ord_e, ord_f, ev.mean, ev.std, ev.n, fv.mean, fv.std, fv.n)
 def get_spline_taylor_expansion(r_target,
                                 r,
                                 coefficients,
@@ -1564,6 +1760,7 @@ def get_spline_taylor_expansion(r_target,
     dr = r - r_target
     y = y_trace + (d1_trace * dr) + (0.5 * d2_trace * dr ** 2)
     return y
+
 
 def dataframe_to_tuples_with_names(df_features,
                         n_elements=None,
@@ -1590,7 +1787,7 @@ def dataframe_to_tuples_with_names(df_features,
     y_index = df_features.index.get_level_values(-1)
     energy_mask = (y_index == energy_key)
     force_mask = np.logical_not(energy_mask)
-    data = df_features.to_numpy()
+    data = df_features.to_numpy(dtype=np.float64)
     y = data[:, 0]
     x = data[:, 1:]
     y_e = y[energy_mask]
@@ -1681,7 +1878,7 @@ def moore_penrose_components(x, y):
     return a, b
 
 
-def batched_moore_penrose(x, y, batch_size=2500):
+def batched_moore_penrose(x, y, batch_size=500):
     n_samples, n_features = x.shape
 
     if n_samples <= batch_size:
@@ -1689,20 +1886,28 @@ def batched_moore_penrose(x, y, batch_size=2500):
 
     gram = np.zeros((n_features, n_features), dtype=np.float64)
     ordinate = np.zeros(n_features, dtype=np.float64)
-
+    print("moore penrose setup")
+    print_mem()
+    t0 = time.perf_counter()
+    loop_count = 0
     for start in range(0, n_samples, batch_size):
         stop = min(start + batch_size, n_samples)
+        t1 = time.perf_counter()
         x_batch = x[start:stop]
         y_batch = y[start:stop]
 
         g, o = moore_penrose_components(x_batch, y_batch)
-        gram += g
-        ordinate += o
-
+        np.add(gram, g, out=gram)
+        np.add(ordinate, o, out=ordinate)
+        t2 = time.perf_counter()
+        print(f"Batch {loop_count} | samples {start}:{stop} | time: {t2 - t1:.4f}s")
         del x_batch, y_batch, g, o
-        if (start // batch_size) % 4 == 0:
+        loop_count += 1
+        
+        if (loop_count) % 4 == 0:
             gc.collect()
-
+    t3 = time.perf_counter()
+    print(f"Complete moore penrose {loop_count} | time: {t3 - t0:.4f}s")
     return gram, ordinate
 
 
@@ -1753,7 +1958,7 @@ def weighted_least_squares(x, y, weights=None, regularizer=None):
     n_feats = len(x[0])
     if regularizer is not None:  # append regularizer
         # validate_regularizer(regularizer, n_feats)
-        reg_zeros = np.zeros(len(regularizer))
+        reg_zeros = np.zeros(len(regularizer), dtype=np.float64)
         x_fit = np.concatenate([x_fit, regularizer])
         y_fit = np.concatenate([y_fit, reg_zeros])
     solution = linear_least_squares(x_fit, y_fit)
@@ -1830,7 +2035,7 @@ def revert_frozen_coefficients(solution: np.ndarray,
     Returns:
         full_solution (np.ndarray)
     """
-    full_solution = np.zeros(n_coeff)
+    full_solution = np.zeros(n_coeff, dtype=np.float64)
     np.put_along_axis(full_solution, mask, solution, 0)
     np.put_along_axis(full_solution, frozen_idx, frozen_c, 0)
     return full_solution

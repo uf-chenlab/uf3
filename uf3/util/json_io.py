@@ -141,6 +141,8 @@ class CompactJSONEncoder(json.JSONEncoder):
         elif isinstance(o, str):  # escape newlines
             o = o.replace("\n", "\\n")
             return f'"{o}"'
+        elif isinstance(o, (np.integer, np.floating)):
+            return json.dumps(o.item())
         else:
             return json.dumps(o)
 
