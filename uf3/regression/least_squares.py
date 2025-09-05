@@ -936,66 +936,7 @@ class WeightedLinearModel(BasicLinearModel):
         if not dfs:
             raise RuntimeError("Every load failed – nothing to fit on.")
 
-        # zero-copy concat; keeps memory very low
-        if use_cur:
-            def _apply_cur(self, df: pd.DataFrame, rank: int = 100) -> pd.DataFrame:
-                def _get_spline_basis_columns(self, df: pd.DataFrame) -> List[str]:
-                    # known non-feature columns
-                    non_features = {"y", 'n_N', 'n_Al', 'n_Ga'}
-                    non_features.update(c for c in df.columns if c.startswith("n_"))
-
-                    return [col for col in df.select_dtypes(include=[np.number]).columns
-                            if col not in non_features]
-                def _estimate_rank( W: np.ndarray, energy_threshold: float = 0.99, max_rank: int = None) -> int:
-
-                    # conservative over-sampling to get energy curve
-                    oversample = min(50, W.shape[1] - 1)
-                    U, S, VT = randomized_svd(W, n_components=oversample)
-                    energy = np.cumsum(S**2) / np.sum(S**2)
-                    rank = np.searchsorted(energy, energy_threshold) + 1
-
-                    if max_rank is not None:
-                        rank = min(rank, max_rank)
-
-                    print(f"[CUR] Estimated rank for {energy_threshold:.0%} energy: {rank}")
-                    return rank
-
-                # assumes multi-index like (filename, table_name)
-                weight_cols = _get_spline_basis_columns(self, df)
-
-                if len(weight_cols) == 0:
-                    raise ValueError("No spline weight columns found (WW*)")
-
-                W = df[weight_cols].to_numpy()
-                rank = _estimate_rank(W, energy_threshold=0.75, max_rank=weight_cols.__len__())
-
-                # low-rank approx via randomized SVD
-                U, S, VT = randomized_svd(W, n_components=min(rank, W.shape[1]))
-
-                row_scores = np.sum(U**2, axis=1)
-                col_scores = np.sum(VT.T**2, axis=1)
-
-                row_idx = np.argsort(row_scores)[-rank:]
-                col_idx = np.argsort(col_scores)[-rank:]
-
-                C = W[:, col_idx]
-                R = W[row_idx, :]
-                W_sub = W[np.ix_(row_idx, col_idx)]
-
-                try:
-                    U_cur = np.linalg.pinv(W_sub)
-                except np.linalg.LinAlgError:
-                    raise RuntimeError("CUR failed: W is singular")
-
-                approx = C @ U_cur @ R
-                df_cur = df.copy()
-                df_cur.loc[:, weight_cols] = approx
-                err = np.linalg.norm(W - approx, ord='fro') / np.linalg.norm(W, ord='fro')
-                print(f"[CUR] Relative Frobenius error: {err:.4f}")
-                return df_cur
-            return _apply_cur(self, pd.concat(dfs, axis=0, copy=False))
-        else:
-            return pd.concat(dfs, axis=0, copy=False)
+        return pd.concat(dfs, axis=0, copy=False)
     def drop_excluded_columns(self, exclude_elements, df):
         if exclude_elements is not None:
             sizes, offsets = self.bspline_config.get_interaction_partitions()
@@ -1175,49 +1116,80 @@ class WeightedLinearModel(BasicLinearModel):
         progress: str = "bar",
         exclude_elements: List[str] = None
     ):
-        
         if self.coefficients is None:
             raise RuntimeError("Model must be fit before fine-tuning.")
         if not (0.0 <= alpha <= 1.0):
             raise ValueError("alpha must be between 0 and 1")
+
+        import os, gc, multiprocessing
+        from tqdm import tqdm
+        import joblib
+
+        # keep thread pools sane when using process parallelism
+        if num_cores > 4:
+            os.environ["MKL_NUM_THREADS"] = "4"
+            os.environ["OMP_NUM_THREADS"] = "4"
+            num_cores = num_cores // 4
+
         df = self.drop_excluded_columns(exclude_elements, df)
+
         gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
         e_var, f_var = VarianceRecorder(), VarianceRecorder()
 
-        idx_splits = np.array_split(np.arange(len(df)), max(1, num_cores))
-        data_splits = [df.iloc[idx] for idx in idx_splits]
-        lock = threading.Lock()
+        idx = np.arange(len(df))
+        splits = np.array_split(idx, max(max(1, num_cores), len(idx) / 30000))
+        data_splits = [df.iloc[i].copy(deep=False) for i in splits]
+        del df
 
-        def _process(chunk):
-            if chunk.empty:
-                return
-            keys = chunk.index.unique(level=0)
-            result = WeightedLinearModel.process_keys(
-                chunk, keys, batch_size,
-                sample_weights, energy_key, self
+        # minimal state needed by the worker, avoid pickling the whole model
+        model_config = {
+            "mask": self.mask,
+            "frozen_c": self.frozen_c,
+            "col_idx": self.col_idx,
+            "n_elements": len(self.bspline_config.element_list)
+        }
+
+        # process in batches of size num_cores to bound memory
+        for i in range(0, len(data_splits), num_cores):
+            batch = data_splits[i:i + num_cores]
+
+            results = joblib.Parallel(n_jobs=num_cores, backend="loky")(
+                joblib.delayed(process_chunk_serializable)(
+                    chunk,
+                    model_config,
+                    energy_key,
+                    batch_size,
+                    sample_weights,
+                    None  # outlier_config not used in fine-tune
+                )
+                for chunk in tqdm(
+                    batch,
+                    desc=f"Processing batch {i // num_cores + 1}",
+                    unit="chunk",
+                    disable=(progress != "bar")
+                )
             )
-            if result is None:
-                return
-            g_e, g_f, o_e, o_f, ev, fv = result
-            with lock:
+
+            # merge per-process outputs
+            for result in results:
+                if result is None:
+                    continue
+                g_e, g_f, o_e, o_f, e_mean, e_std, e_n, f_mean, f_std, f_n = result
+
                 np.add(gram_e, g_e, out=gram_e)
                 np.add(gram_f, g_f, out=gram_f)
                 np.add(ord_e, o_e, out=ord_e)
                 np.add(ord_f, o_f, out=ord_f)
-                e_var.update_manual(ev.mean, ev.std, ev.n)
-                f_var.update_manual(fv.mean, fv.std, fv.n)
 
-        with ThreadPoolExecutor(max_workers=max(1, num_cores)) as ex:
-            futs = [ex.submit(_process, chunk) for chunk in data_splits]
-            if progress == "bar":
-                pbar = tqdm(total=len(futs), desc="Fine-tuning", unit="batch")
-            for fut in as_completed(futs):
-                fut.result()
-                if progress == "bar":
-                    pbar.update()
-            if progress == "bar":
-                pbar.close()
+                e_var.update_manual(e_mean, e_std, e_n)
+                f_var.update_manual(f_mean, f_std, f_n)
 
+                # free large arrays promptly
+                del g_e, g_f, o_e, o_f
+
+            gc.collect()
+
+        # same weighting + solve as before
         e_w, f_w = calc_E_F_weights(e_var.n, f_var.n, e_var.std, f_var.std)
         gram, ordinate = self.combine_weighted_gram(
             gram_e, gram_f, ord_e, ord_f, e_w, f_w, weight
@@ -1225,12 +1197,15 @@ class WeightedLinearModel(BasicLinearModel):
 
         regularizer = freeze_regularizer(self.regularizer, self.mask)
         regularizer = np.dot(regularizer.T, regularizer)
+
         coeff_update = lu_factorization(gram + regularizer, ordinate)
         coeff_update = revert_frozen_coefficients(
             coeff_update, self.n_feats, self.mask, self.frozen_c, self.col_idx
         )
 
+        # blended update
         self.coefficients = (1 - alpha) * self.coefficients + alpha * coeff_update
+
     def gram_from_df(self,
                      df: pd.DataFrame,
                      keys: Collection,

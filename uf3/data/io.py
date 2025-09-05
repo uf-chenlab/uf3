@@ -388,8 +388,7 @@ def parse_trajectory(fname: str,
         df.index = new_index
         print('Loaded index from file:', fname)
     elif prefix is not None:
-        pattern = '{}_{{}}'.format(prefix)
-        df = df.rename(pattern.format)
+        df.index = [f'{prefix}_{i}' for i in range(len(df))]
     return df
 
 def find_nelm(path):
