@@ -1,5 +1,7 @@
 from typing import List, Dict, Collection, Tuple
 import os
+import tempfile
+import shutil
 import warnings
 import numpy as np
 import pandas as pd
@@ -875,50 +877,85 @@ class WeightedLinearModel(BasicLinearModel):
         weight: float = 0.5,
         batch_size: int = 1000,
         num_cores: int = -1,
+        threads_per_worker: int = 4,
         progress: str = "bar",
+        backend: str = "loky",
         exclude_elements: List[str] = None,
-        outlier_config: Dict = None,
-        threads_per_worker: int = 2,
+        outlier_config: Dict = None
     ):
         """
-        Fits the model from pre-prepared NumPy arrays. This is the computational
-        step, designed to be called repeatedly with different hyperparameters.
+        Fits the model from pre-prepared NumPy arrays using a configurable parallel backend
+        and manages nested parallelism (joblib processes vs. NumPy threads).
+        This version is highly memory-efficient as it avoids copying data for workers
+        by using memory-mapping.
         """
         if num_cores == -1:
             num_cores = os.cpu_count() or 1
+
+        if backend not in ["loky", "threading"]:
+            raise ValueError("backend must be either 'loky' or 'threading'")
+        
+        # --- Nested Parallelism Management ---
+        if threads_per_worker > 1 and backend == 'loky':
+            os.environ["OMP_NUM_THREADS"] = str(threads_per_worker)
+            os.environ["MKL_NUM_THREADS"] = str(threads_per_worker)
+            os.environ["OPENBLAS_NUM_THREADS"] = str(threads_per_worker)
+            n_jobs = max(1, num_cores // threads_per_worker)
+            print(f"--- Starting Fit: {n_jobs} processes x {threads_per_worker} threads/process ({backend} backend) ---")
+        else:
+            os.environ["OMP_NUM_THREADS"] = "1"
+            os.environ["MKL_NUM_THREADS"] = "1"
+            os.environ["OPENBLAS_NUM_THREADS"] = "1"
+            n_jobs = num_cores
+            print(f"--- Starting Fit: {n_jobs} processes x 1 thread/process ({backend} backend) ---")
+
+        if exclude_elements:
+             warnings.warn("'exclude_elements' is not yet implemented for the NumPy-only workflow.")
+
+        # --- Memory-Efficient Job Creation using Memory Mapping ---
+        temp_dir = tempfile.mkdtemp()
+        try:
+            # Save the large arrays to disk to be memory-mapped by workers
+            data_filenames = {
+                'x_e': os.path.join(temp_dir, 'x_e.mmap'),
+                'y_e': os.path.join(temp_dir, 'y_e.mmap'),
+                'x_f': os.path.join(temp_dir, 'x_f.mmap'),
+                'y_f': os.path.join(temp_dir, 'y_f.mmap'),
+            }
+            joblib.dump(prepared_data['x_e'], data_filenames['x_e'])
+            joblib.dump(prepared_data['y_e'], data_filenames['y_e'])
+            joblib.dump(prepared_data['x_f'], data_filenames['x_f'])
+            joblib.dump(prepared_data['y_f'], data_filenames['y_f'])
             
-        os.environ["OMP_NUM_THREADS"] = str(threads_per_worker)
-        os.environ["MKL_NUM_THREADS"] = str(threads_per_worker)
-        os.environ["NUMEXPR_NUM_THREADS"] = str(threads_per_worker)
-        os.environ["OPENBLAS_NUM_THREADS"] = str(threads_per_worker)
-        n_jobs = max(1, num_cores // threads_per_worker)
-        print(f"--- Starting Fit from Prepared Data on {num_cores} cores ---")
+            # ** CRITICAL FIX: Delete in-memory copy before starting workers **
+            del prepared_data
+            gc.collect()
 
-        x_e, y_e = prepared_data["x_e"], prepared_data["y_e"]
-        x_f, y_f = prepared_data["x_f"], prepared_data["y_f"]
+            # Split the *indices* of the arrays, not the arrays themselves
+            # We need to re-read the shape from the memory-mapped file for safety
+            x_e_len = joblib.load(data_filenames['x_e'], mmap_mode='r').shape[0]
+            x_f_len = joblib.load(data_filenames['x_f'], mmap_mode='r').shape[0]
 
-        # Split the *indices* of the arrays, not the arrays themselves
-        e_idx_splits = np.array_split(np.arange(len(x_e)), n_jobs)
-        f_idx_splits = np.array_split(np.arange(len(x_f)), n_jobs)
+            e_idx_splits = np.array_split(np.arange(x_e_len), n_jobs)
+            f_idx_splits = np.array_split(np.arange(x_f_len), n_jobs)
+            
+            job_indices_list = [(e_idx_splits[i], f_idx_splits[i]) for i in range(n_jobs)]
+            
+            model_config = {
+                "mask": self.mask,
+                "frozen_c": self.frozen_c,
+                "col_idx": self.col_idx,
+            }
 
-        # The full data tuple will be passed once and shared by joblib
-        full_data_tuple = (x_e, y_e, x_f, y_f)
-        
-        # The list of jobs contains only small index arrays
-        job_indices_list = [(e_idx_splits[i], f_idx_splits[i]) for i in range(n_jobs)]
-        
-        model_config = {
-            "mask": self.mask,
-            "frozen_c": self.frozen_c,
-            "col_idx": self.col_idx,
-        }
-
-        print(f"Processing chunks in parallel with 'loky' backend...")
-        results = joblib.Parallel(n_jobs=n_jobs, backend='loky')(
-            joblib.delayed(_process_numpy_chunk_parallel)(
-                full_data_tuple, job_indices, model_config, batch_size, outlier_config
-            ) for job_indices in tqdm(job_indices_list, desc="Processing Chunks", disable=(progress != "bar"))
-        )
+            print(f"Processing chunks in parallel with '{backend}' backend...")
+            results = joblib.Parallel(n_jobs=n_jobs, backend=backend)(
+                joblib.delayed(_process_numpy_chunk_parallel)(
+                    data_filenames, job_indices, model_config, batch_size, outlier_config
+                ) for job_indices in tqdm(job_indices_list, desc="Processing Chunks", disable=(progress != "bar"))
+            )
+        finally:
+            # Clean up the temporary directory and memory-mapped files
+            shutil.rmtree(temp_dir)
 
         # --- Aggregate Results ---
         gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
@@ -2230,13 +2267,16 @@ def freeze_regularizer(regularizer: np.ndarray,
     regularizer = regularizer[:, mask]
     return regularizer
 
-def _process_numpy_chunk_parallel(full_data, job_indices, model_config, batch_size, outlier_config):
+def _process_numpy_chunk_parallel(data_filenames, job_indices, model_config, batch_size, outlier_config):
     """
-    Standalone worker function for parallelism. It operates on slices of the full
-    NumPy arrays, which are efficiently shared by joblib, avoiding copies.
+    Standalone worker function that uses memory-mapped arrays to reduce RAM usage.
     """
-    # 1. Unpack the full arrays and the specific indices for this job
-    x_e_full, y_e_full, x_f_full, y_f_full = full_data
+    # 1. Load the full arrays via memory-mapping (very low RAM usage)
+    x_e_full = joblib.load(data_filenames['x_e'], mmap_mode='r')
+    y_e_full = joblib.load(data_filenames['y_e'], mmap_mode='r')
+    x_f_full = joblib.load(data_filenames['x_f'], mmap_mode='r')
+    y_f_full = joblib.load(data_filenames['y_f'], mmap_mode='r')
+    
     e_indices, f_indices = job_indices
     
     # 2. Create local views (slices) of the data for this worker. This is memory-efficient.
