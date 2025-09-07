@@ -877,7 +877,8 @@ class WeightedLinearModel(BasicLinearModel):
         num_cores: int = -1,
         progress: str = "bar",
         exclude_elements: List[str] = None,
-        outlier_config: Dict = None
+        outlier_config: Dict = None,
+        threads_per_worker: int = 2,
     ):
         """
         Fits the model from pre-prepared NumPy arrays. This is the computational
@@ -886,29 +887,40 @@ class WeightedLinearModel(BasicLinearModel):
         if num_cores == -1:
             num_cores = os.cpu_count() or 1
             
+        os.environ["OMP_NUM_THREADS"] = str(threads_per_worker)
+        os.environ["MKL_NUM_THREADS"] = str(threads_per_worker)
+        os.environ["NUMEXPR_NUM_THREADS"] = str(threads_per_worker)
+        os.environ["OPENBLAS_NUM_THREADS"] = str(threads_per_worker)
+        n_jobs = max(1, num_cores // threads_per_worker)
         print(f"--- Starting Fit from Prepared Data on {num_cores} cores ---")
-
-        if exclude_elements:
-             warnings.warn("'exclude_elements' is not yet implemented for the NumPy-only workflow. Please filter data beforehand.")
 
         x_e, y_e = prepared_data["x_e"], prepared_data["y_e"]
         x_f, y_f = prepared_data["x_f"], prepared_data["y_f"]
 
-        e_splits = np.array_split(np.arange(len(x_e)), num_cores)
-        f_splits = np.array_split(np.arange(len(x_f)), num_cores)
+        # Split the *indices* of the arrays, not the arrays themselves
+        e_idx_splits = np.array_split(np.arange(len(x_e)), n_jobs)
+        f_idx_splits = np.array_split(np.arange(len(x_f)), n_jobs)
 
-        data_chunks = [{
-            "x_e": x_e[e_splits[i]], "y_e": y_e[e_splits[i]],
-            "x_f": x_f[f_splits[i]], "y_f": y_f[f_splits[i]],
-        } for i in range(num_cores)]
+        # The full data tuple will be passed once and shared by joblib
+        full_data_tuple = (x_e, y_e, x_f, y_f)
+        
+        # The list of jobs contains only small index arrays
+        job_indices_list = [(e_idx_splits[i], f_idx_splits[i]) for i in range(n_jobs)]
+        
+        model_config = {
+            "mask": self.mask,
+            "frozen_c": self.frozen_c,
+            "col_idx": self.col_idx,
+        }
 
-        print("Processing chunks in parallel...")
-        results = joblib.Parallel(n_jobs=num_cores, backend="loky")(
-            joblib.delayed(self._process_numpy_chunk)(
-                chunk, batch_size, outlier_config
-            ) for chunk in tqdm(data_chunks, desc="Processing Chunks", disable=(progress != "bar"))
+        print(f"Processing chunks in parallel with 'loky' backend...")
+        results = joblib.Parallel(n_jobs=n_jobs, backend='loky')(
+            joblib.delayed(_process_numpy_chunk_parallel)(
+                full_data_tuple, job_indices, model_config, batch_size, outlier_config
+            ) for job_indices in tqdm(job_indices_list, desc="Processing Chunks", disable=(progress != "bar"))
         )
 
+        # --- Aggregate Results ---
         gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
         e_var, f_var = VarianceRecorder(), VarianceRecorder()
         for result in results:
@@ -960,9 +972,11 @@ class WeightedLinearModel(BasicLinearModel):
         progress: str = "bar"
     ) -> Dict[str, np.ndarray]:
         """
-        Loads data from HDF5 files directly into pre-allocated NumPy arrays,
-        bypassing the memory-intensive pd.concat step. This is the I/O and
-        preparation step, designed to be called once from a model instance.
+        Loads data from HDF5 files directly into pre-allocated NumPy arrays.
+        This version uses a two-pass strategy to be highly memory-efficient:
+        1. A lightweight first pass scans table metadata to calculate the total size.
+        2. A second pass loads each table *sequentially* to prevent memory spikes,
+           copies its data, and immediately discards it.
 
         Returns:
             Dict[str, np.ndarray]: A dictionary containing the prepared NumPy arrays
@@ -972,7 +986,7 @@ class WeightedLinearModel(BasicLinearModel):
             num_cores = os.cpu_count() or 1
             
         print("--- Starting Data Load and Preparation (Memory-Optimized) ---")
-        log_total_memory("Initial state")
+        # log_total_memory("Initial state")
 
         # --- 1. Discover all table jobs ---
         table_jobs = []
@@ -981,6 +995,7 @@ class WeightedLinearModel(BasicLinearModel):
                 warnings.warn(f"File not found, skipping: {fname}")
                 continue
             try:
+                # Assuming io is imported from uf3.data
                 _, _, table_names, _ = io.analyze_hdf_tables(fname)
                 table_jobs.extend([(fname, tname) for tname in table_names])
             except Exception as e:
@@ -989,75 +1004,94 @@ class WeightedLinearModel(BasicLinearModel):
         if not table_jobs:
             raise ValueError("No tables found in any of the provided files.")
 
-        # --- 2. Load all data from disk ONCE into a list of DataFrames ---
-        print("Loading all tables from disk once...")
-        loaded_dfs = []
+        # --- 2. Lightweight Pre-scan to determine total dimensions ---
+        print("Pre-scanning tables to determine total data size...")
+        total_e_rows, total_f_rows, n_features = 0, 0, 0
+        
+        # Determine n_features from the first valid table
+        for job in table_jobs:
+            # Assuming process is imported from uf3.representation
+            temp_df = process.load_feature_db(job[0], job[1], subset)
+            if temp_df is not None and not temp_df.empty:
+                n_features = len(temp_df.columns) - 1
+                break
+        if n_features == 0:
+            raise ValueError("Could not determine feature dimensions from the provided subset.")
+        del temp_df
+
+        # Function for the pre-scan worker threads
+        def _scan_chunk_size(job):
+            df_scan = process.load_feature_db(job[0], job[1], subset)
+            if df_scan is None or df_scan.empty:
+                return 0, 0
+            index = df_scan.index
+            e_count = (index.get_level_values(-1) == energy_key).sum()
+            f_count = len(index) - e_count
+            return e_count, f_count
+
         with ThreadPoolExecutor(max_workers=num_cores) as executor:
-            future_to_df = {
-                executor.submit(process.load_feature_db, job[0], job[1], subset): job
-                for job in table_jobs
-            }
-            pbar = tqdm(as_completed(future_to_df), total=len(future_to_df), desc="Loading tables")
+            future_to_job = {executor.submit(_scan_chunk_size, job): job for job in table_jobs}
+            pbar = tqdm(as_completed(future_to_job), total=len(future_to_job), desc="Scanning table sizes")
             for future in pbar:
                 try:
-                    df_chunk = future.result()
-                    if df_chunk is not None and not df_chunk.empty:
-                        loaded_dfs.append(df_chunk)
+                    e_count, f_count = future.result()
+                    total_e_rows += e_count
+                    total_f_rows += f_count
                 except Exception as e:
-                    job_info = future_to_df[future]
-                    warnings.warn(f"Failed to load table {job_info[0]}:{job_info[1]}: {e}")
-        
-        log_total_memory("After loading all DataFrames into memory")
+                    job_info = future_to_job[future]
+                    warnings.warn(f"Failed to scan table {job_info[0]}:{job_info[1]}: {e}")
 
-        # --- 3. Calculate total size from in-memory DataFrames ---
-        print("Calculating total data size from loaded chunks...")
-        total_e_rows, total_f_rows, n_features = 0, 0, 0
-        if not loaded_dfs:
+        if total_e_rows == 0 and total_f_rows == 0:
             raise ValueError("No data found for the given subset.")
-        
-        n_features = len(loaded_dfs[0].columns) - 1 # All DFs have same columns
-
-        for df_chunk in loaded_dfs:
-            index = df_chunk.index
-            e_count = (index.get_level_values(-1) == energy_key).sum()
-            total_e_rows += e_count
-            total_f_rows += len(index) - e_count
 
         print(f"Allocation plan: {total_e_rows} energy rows, {total_f_rows} force rows, {n_features} features.")
 
-        # --- 4. Pre-allocate final NumPy arrays ---
+        # --- 3. Pre-allocate final NumPy arrays ---
         x_e_final = np.zeros((total_e_rows, n_features), dtype=np.float64)
         y_e_final = np.zeros(total_e_rows, dtype=np.float64)
         x_f_final = np.zeros((total_f_rows, n_features), dtype=np.float64)
         y_f_final = np.zeros(total_f_rows, dtype=np.float64)
         
-        log_total_memory("After pre-allocating NumPy arrays")
+        # log_total_memory("After pre-allocating NumPy arrays")
 
-        # --- 5. Fill NumPy arrays from the in-memory DataFrames ---
-        print("Filling final arrays from in-memory data...")
+        # --- 4. Second Pass: SEQUENTIAL Load and Fill to minimize memory ---
+        print("Filling final arrays sequentially to conserve memory...")
         e_cursor, f_cursor = 0, 0
         n_elements = len(self.bspline_config.element_list)
-        
-        for df_chunk in tqdm(loaded_dfs, desc="Processing in-memory chunks"):
-            x_e, y_e, x_f, y_f = dataframe_to_tuples(
-                df_chunk, n_elements, energy_key, sample_weights
-            )
-            
-            e_len = len(y_e)
-            if e_len > 0:
-                x_e_final[e_cursor : e_cursor + e_len, :] = x_e
-                y_e_final[e_cursor : e_cursor + e_len] = y_e
-                e_cursor += e_len
-            
-            f_len = len(y_f)
-            if f_len > 0:
-                x_f_final[f_cursor : f_cursor + f_len, :] = x_f
-                y_f_final[f_cursor : f_cursor + f_len] = y_f
-                f_cursor += f_len
 
-        del loaded_dfs # Free the list of DataFrames
+        for job in tqdm(table_jobs, desc="Loading and filling data"):
+            try:
+                # Load one DataFrame at a time
+                df_chunk = process.load_feature_db(job[0], job[1], subset)
+                if df_chunk is None or df_chunk.empty:
+                    continue
+
+                x_e, y_e, x_f, y_f = dataframe_to_tuples(
+                    df_chunk, n_elements, energy_key, sample_weights
+                )
+                
+                e_len = len(y_e)
+                if e_len > 0:
+                    x_e_final[e_cursor : e_cursor + e_len, :] = x_e
+                    y_e_final[e_cursor : e_cursor + e_len] = y_e
+                    e_cursor += e_len
+                
+                f_len = len(y_f)
+                if f_len > 0:
+                    x_f_final[f_cursor : f_cursor + f_len, :] = x_f
+                    y_f_final[f_cursor : f_cursor + f_len] = y_f
+                    f_cursor += f_len
+                
+                # Explicitly delete the DataFrame to help free memory immediately
+                del df_chunk
+                
+            except Exception as e:
+                warnings.warn(f"Failed processing chunk {job[0]}:{job[1]}: {e}")
+        
+        # A single garbage collect after the loop can be helpful
         gc.collect()
-        log_total_memory("After filling arrays")
+
+        # log_total_memory("After filling arrays")
         print("--- Data Preparation Complete ---")
         return {"x_e": x_e_final, "y_e": y_e_final, "x_f": x_f_final, "y_f": y_f_final}
     
@@ -2196,6 +2230,39 @@ def freeze_regularizer(regularizer: np.ndarray,
     regularizer = regularizer[:, mask]
     return regularizer
 
+def _process_numpy_chunk_parallel(full_data, job_indices, model_config, batch_size, outlier_config):
+    """
+    Standalone worker function for parallelism. It operates on slices of the full
+    NumPy arrays, which are efficiently shared by joblib, avoiding copies.
+    """
+    # 1. Unpack the full arrays and the specific indices for this job
+    x_e_full, y_e_full, x_f_full, y_f_full = full_data
+    e_indices, f_indices = job_indices
+    
+    # 2. Create local views (slices) of the data for this worker. This is memory-efficient.
+    x_e, y_e = x_e_full[e_indices], y_e_full[e_indices]
+    x_f, y_f = x_f_full[f_indices], y_f_full[f_indices]
+
+    # Unpack model config
+    mask = model_config["mask"]
+    frozen_c = model_config["frozen_c"]
+    col_idx = model_config["col_idx"]
+
+    if outlier_config:
+        x_e, y_e = apply_global_filters(x_e, y_e, config=outlier_config)
+        x_f, y_f = apply_global_filters(x_f, y_f, config=outlier_config)
+
+    x_e, y_e = freeze_columns(x_e, y_e, mask, frozen_c, col_idx)
+    x_f, y_f = freeze_columns(x_f, y_f, mask, frozen_c, col_idx)
+
+    gram_e, ord_e = batched_moore_penrose(x_e, y_e, batch_size)
+    gram_f, ord_f = batched_moore_penrose(x_f, y_f, batch_size)
+
+    ev, fv = VarianceRecorder(), VarianceRecorder()
+    if len(y_e) > 0: ev.update(y_e)
+    if len(y_f) > 0: fv.update(y_f)
+
+    return (gram_e, gram_f, ord_e, ord_f, ev.mean, ev.std, ev.n, fv.mean, fv.std, fv.n)
 
 def revert_frozen_coefficients(solution: np.ndarray,
                                n_coeff: int,
