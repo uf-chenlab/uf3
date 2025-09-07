@@ -869,7 +869,198 @@ class WeightedLinearModel(BasicLinearModel):
         )
 
         self.fit_with_gram(gram, ordinate)
+    def fit_from_prepared_data(
+        self,
+        prepared_data: Dict[str, np.ndarray],
+        weight: float = 0.5,
+        batch_size: int = 1000,
+        num_cores: int = -1,
+        progress: str = "bar",
+        exclude_elements: List[str] = None,
+        outlier_config: Dict = None
+    ):
+        """
+        Fits the model from pre-prepared NumPy arrays. This is the computational
+        step, designed to be called repeatedly with different hyperparameters.
+        """
+        if num_cores == -1:
+            num_cores = os.cpu_count() or 1
+            
+        print(f"--- Starting Fit from Prepared Data on {num_cores} cores ---")
 
+        if exclude_elements:
+             warnings.warn("'exclude_elements' is not yet implemented for the NumPy-only workflow. Please filter data beforehand.")
+
+        x_e, y_e = prepared_data["x_e"], prepared_data["y_e"]
+        x_f, y_f = prepared_data["x_f"], prepared_data["y_f"]
+
+        e_splits = np.array_split(np.arange(len(x_e)), num_cores)
+        f_splits = np.array_split(np.arange(len(x_f)), num_cores)
+
+        data_chunks = [{
+            "x_e": x_e[e_splits[i]], "y_e": y_e[e_splits[i]],
+            "x_f": x_f[f_splits[i]], "y_f": y_f[f_splits[i]],
+        } for i in range(num_cores)]
+
+        print("Processing chunks in parallel...")
+        results = joblib.Parallel(n_jobs=num_cores, backend="loky")(
+            joblib.delayed(self._process_numpy_chunk)(
+                chunk, batch_size, outlier_config
+            ) for chunk in tqdm(data_chunks, desc="Processing Chunks", disable=(progress != "bar"))
+        )
+
+        gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
+        e_var, f_var = VarianceRecorder(), VarianceRecorder()
+        for result in results:
+            if result is None: continue
+            g_e, g_f, o_e, o_f, e_mean, e_std, e_n, f_mean, f_std, f_n = result
+            gram_e += g_e
+            gram_f += g_f
+            ord_e += o_e
+            ord_f += o_f
+            e_var.update_manual(e_mean, e_std, e_n)
+            f_var.update_manual(f_mean, f_std, f_n)
+
+        print("Finalizing fit...")
+        e_w, f_w = calc_E_F_weights(e_var.n, f_var.n, e_var.std, f_var.std)
+        gram, ord_ = self.combine_weighted_gram(gram_e, gram_f, ord_e, ord_f, e_w, f_w, weight)
+        self.fit_with_gram(gram, ord_)
+        print("--- Fit complete ---")
+
+    def _process_numpy_chunk(self, chunk, batch_size, outlier_config):
+        """
+        Helper method to be run in parallel. Operates directly on NumPy arrays.
+        (This should be part of the WeightedLinearModel class).
+        """
+        x_e, y_e = chunk["x_e"], chunk["y_e"]
+        x_f, y_f = chunk["x_f"], chunk["y_f"]
+
+        if outlier_config:
+            x_e, y_e = apply_global_filters(x_e, y_e, config=outlier_config)
+            x_f, y_f = apply_global_filters(x_f, y_f, config=outlier_config)
+
+        x_e, y_e = freeze_columns(x_e, y_e, self.mask, self.frozen_c, self.col_idx)
+        x_f, y_f = freeze_columns(x_f, y_f, self.mask, self.frozen_c, self.col_idx)
+
+        gram_e, ord_e = batched_moore_penrose(x_e, y_e, batch_size)
+        gram_f, ord_f = batched_moore_penrose(x_f, y_f, batch_size)
+        
+        ev, fv = VarianceRecorder(), VarianceRecorder()
+        if len(y_e) > 0: ev.update(y_e)
+        if len(y_f) > 0: fv.update(y_f)
+
+        return (gram_e, gram_f, ord_e, ord_f, ev.mean, ev.std, ev.n, fv.mean, fv.std, fv.n)
+    def load_and_prepare_data(
+        self,
+        filenames: List[str],
+        subset: Collection,
+        sample_weights: Dict = None,
+        energy_key: str = "energy",
+        num_cores: int = -1,
+        progress: str = "bar"
+    ) -> Dict[str, np.ndarray]:
+        """
+        Loads data from HDF5 files directly into pre-allocated NumPy arrays,
+        bypassing the memory-intensive pd.concat step. This is the I/O and
+        preparation step, designed to be called once from a model instance.
+
+        Returns:
+            Dict[str, np.ndarray]: A dictionary containing the prepared NumPy arrays
+                                   ('x_e', 'y_e', 'x_f', 'y_f').
+        """
+        if num_cores == -1:
+            num_cores = os.cpu_count() or 1
+            
+        print("--- Starting Data Load and Preparation (Memory-Optimized) ---")
+        log_total_memory("Initial state")
+
+        # --- 1. Discover all table jobs ---
+        table_jobs = []
+        for fname in filenames:
+            if not os.path.isfile(fname):
+                warnings.warn(f"File not found, skipping: {fname}")
+                continue
+            try:
+                _, _, table_names, _ = io.analyze_hdf_tables(fname)
+                table_jobs.extend([(fname, tname) for tname in table_names])
+            except Exception as e:
+                warnings.warn(f"Could not analyze HDF5 file {fname}: {e}")
+
+        if not table_jobs:
+            raise ValueError("No tables found in any of the provided files.")
+
+        # --- 2. Load all data from disk ONCE into a list of DataFrames ---
+        print("Loading all tables from disk once...")
+        loaded_dfs = []
+        with ThreadPoolExecutor(max_workers=num_cores) as executor:
+            future_to_df = {
+                executor.submit(process.load_feature_db, job[0], job[1], subset): job
+                for job in table_jobs
+            }
+            pbar = tqdm(as_completed(future_to_df), total=len(future_to_df), desc="Loading tables")
+            for future in pbar:
+                try:
+                    df_chunk = future.result()
+                    if df_chunk is not None and not df_chunk.empty:
+                        loaded_dfs.append(df_chunk)
+                except Exception as e:
+                    job_info = future_to_df[future]
+                    warnings.warn(f"Failed to load table {job_info[0]}:{job_info[1]}: {e}")
+        
+        log_total_memory("After loading all DataFrames into memory")
+
+        # --- 3. Calculate total size from in-memory DataFrames ---
+        print("Calculating total data size from loaded chunks...")
+        total_e_rows, total_f_rows, n_features = 0, 0, 0
+        if not loaded_dfs:
+            raise ValueError("No data found for the given subset.")
+        
+        n_features = len(loaded_dfs[0].columns) - 1 # All DFs have same columns
+
+        for df_chunk in loaded_dfs:
+            index = df_chunk.index
+            e_count = (index.get_level_values(-1) == energy_key).sum()
+            total_e_rows += e_count
+            total_f_rows += len(index) - e_count
+
+        print(f"Allocation plan: {total_e_rows} energy rows, {total_f_rows} force rows, {n_features} features.")
+
+        # --- 4. Pre-allocate final NumPy arrays ---
+        x_e_final = np.zeros((total_e_rows, n_features), dtype=np.float64)
+        y_e_final = np.zeros(total_e_rows, dtype=np.float64)
+        x_f_final = np.zeros((total_f_rows, n_features), dtype=np.float64)
+        y_f_final = np.zeros(total_f_rows, dtype=np.float64)
+        
+        log_total_memory("After pre-allocating NumPy arrays")
+
+        # --- 5. Fill NumPy arrays from the in-memory DataFrames ---
+        print("Filling final arrays from in-memory data...")
+        e_cursor, f_cursor = 0, 0
+        n_elements = len(self.bspline_config.element_list)
+        
+        for df_chunk in tqdm(loaded_dfs, desc="Processing in-memory chunks"):
+            x_e, y_e, x_f, y_f = dataframe_to_tuples(
+                df_chunk, n_elements, energy_key, sample_weights
+            )
+            
+            e_len = len(y_e)
+            if e_len > 0:
+                x_e_final[e_cursor : e_cursor + e_len, :] = x_e
+                y_e_final[e_cursor : e_cursor + e_len] = y_e
+                e_cursor += e_len
+            
+            f_len = len(y_f)
+            if f_len > 0:
+                x_f_final[f_cursor : f_cursor + f_len, :] = x_f
+                y_f_final[f_cursor : f_cursor + f_len] = y_f
+                f_cursor += f_len
+
+        del loaded_dfs # Free the list of DataFrames
+        gc.collect()
+        log_total_memory("After filling arrays")
+        print("--- Data Preparation Complete ---")
+        return {"x_e": x_e_final, "y_e": y_e_final, "x_f": x_f_final, "y_f": y_f_final}
+    
     def load_tables_parallel(
         self,
         filenames: List[str],
@@ -901,6 +1092,8 @@ class WeightedLinearModel(BasicLinearModel):
         """
         # ---- discover jobs ------------------------------------------------------
         table_jobs = []
+        
+        concat_batch_size=20
         for fname in filenames:
             if not os.path.isfile(fname):
                 raise FileNotFoundError(fname)
@@ -919,24 +1112,37 @@ class WeightedLinearModel(BasicLinearModel):
             except Exception as exc:
                 print(f"[WARN] Could not load {fname}:{tname} – {exc}")
             return None
-
-        dfs = []
+        final_dfs = []
+        batch = []
         with ThreadPoolExecutor(max_workers=max(1, num_cores)) as ex:
             futs = {ex.submit(_load, job): job for job in table_jobs}
 
             pbar = tqdm(total=len(futs), desc="Loading tables", unit="tbl",
                         disable=(progress != "bar"))
+            
             for fut in as_completed(futs):
                 out = fut.result()
-                if out is not None:
-                    dfs.append(out)
+                if out is not None and not out.empty:
+                    batch.append(out)
+                
+                # When the batch is full, concatenate it and add to the final list
+                if len(batch) >= concat_batch_size:
+                    final_dfs.append(pd.concat(batch, axis=0, copy=False))
+                    batch = [] # Clear the batch
+                
                 pbar.update()
+            
+            # Add any remaining dataframes from the last, partially-filled batch
+            if batch:
+                final_dfs.append(pd.concat(batch, axis=0, copy=False))
+
             pbar.close()
 
-        if not dfs:
+        if not final_dfs:
             raise RuntimeError("Every load failed – nothing to fit on.")
 
-        return pd.concat(dfs, axis=0, copy=False)
+        # The final concat is now on a much smaller list of dataframes
+        return pd.concat(final_dfs, axis=0, copy=False)
     def drop_excluded_columns(self, exclude_elements, df):
         if exclude_elements is not None:
             sizes, offsets = self.bspline_config.get_interaction_partitions()
@@ -992,9 +1198,9 @@ class WeightedLinearModel(BasicLinearModel):
         gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
         e_var, f_var = VarianceRecorder(), VarianceRecorder()
         if(num_cores > 4):
-            os.environ["MKL_NUM_THREADS"] = "4"
-            os.environ["OMP_NUM_THREADS"] = "4"
-            num_cores = num_cores//4
+            os.environ["MKL_NUM_THREADS"] = "6"
+            os.environ["OMP_NUM_THREADS"] = "6"
+            num_cores = num_cores//6
         idx = np.arange(len(df))
         splits = np.array_split(idx, max(max(1, num_cores), len(idx)/30000))
         
