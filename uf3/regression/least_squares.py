@@ -1,9 +1,11 @@
-from typing import List, Dict, Collection, Tuple
+from typing import List, Dict, Collection, Tuple, Optional
 import os
 import tempfile
 import shutil
 import warnings
 import numpy as np
+import uuid
+from threading import Lock
 import pandas as pd
 import ndsplines
 from uf3.representation import bspline, process
@@ -19,6 +21,9 @@ import psutil, os
 from sklearn.utils.extmath import randomized_svd
 import threading
 import multiprocessing
+from multiprocessing import shared_memory
+import scipy.optimize
+import ndsplines
 from queue import Queue
 import time
 import joblib
@@ -881,124 +886,316 @@ class WeightedLinearModel(BasicLinearModel):
         progress: str = "bar",
         backend: str = "loky",
         exclude_elements: List[str] = None,
-        outlier_config: Dict = None
+        threads_per_worker: int = 4,
+        outlier_config: Dict = None,
+        max_chunk_size: int = 10000
     ):
         """
-        Fits the model from pre-prepared NumPy arrays using a configurable parallel backend
-        and manages nested parallelism (joblib processes vs. NumPy threads).
-        This version is highly memory-efficient as it avoids copying data for workers
-        by using memory-mapping.
+        Fits the model from pre-prepared NumPy arrays using shared memory to
+        minimize data transfer to parallel workers.
         """
+        # --- Setup for Parallelism (Unchanged) ---
         if num_cores == -1:
             num_cores = os.cpu_count() or 1
 
-        if backend not in ["loky", "threading"]:
-            raise ValueError("backend must be either 'loky' or 'threading'")
-        
-        # --- Nested Parallelism Management ---
-        if threads_per_worker > 1 and backend == 'loky':
-            os.environ["OMP_NUM_THREADS"] = str(threads_per_worker)
-            os.environ["MKL_NUM_THREADS"] = str(threads_per_worker)
-            os.environ["OPENBLAS_NUM_THREADS"] = str(threads_per_worker)
-            n_jobs = max(1, num_cores // threads_per_worker)
-            print(f"--- Starting Fit: {n_jobs} processes x {threads_per_worker} threads/process ({backend} backend) ---")
-        else:
-            os.environ["OMP_NUM_THREADS"] = "1"
-            os.environ["MKL_NUM_THREADS"] = "1"
-            os.environ["OPENBLAS_NUM_THREADS"] = "1"
-            n_jobs = num_cores
-            print(f"--- Starting Fit: {n_jobs} processes x 1 thread/process ({backend} backend) ---")
+        os.environ["OMP_NUM_THREADS"] = str(threads_per_worker)
+        os.environ["MKL_NUM_THREADS"] = str(threads_per_worker)
+        n_jobs = max(1, num_cores // threads_per_worker)
+        print(f"--- Starting Fit: {n_jobs} processes x {threads_per_worker} threads/process (loky backend) ---")
 
         if exclude_elements:
-             warnings.warn("'exclude_elements' is not yet implemented for the NumPy-only workflow.")
+            warnings.warn("'exclude_elements' is not yet implemented for this workflow.")
 
-        # --- Memory-Efficient Job Creation using Memory Mapping ---
-        temp_dir = tempfile.mkdtemp()
+        x_e_orig, y_e_orig = prepared_data["x_e"], prepared_data["y_e"]
+        x_f_orig, y_f_orig = prepared_data["x_f"], prepared_data["y_f"]
+
+        # --- Data Splitting Logic (Unchanged) ---
+        total_rows = len(x_e_orig) + len(x_f_orig)
+        if total_rows == 0:
+            print("No data to fit. Exiting.")
+            return
+
+        num_splits = max(1, int(total_rows / max_chunk_size), n_jobs)
+        print(f"Splitting data into {num_splits} chunks for processing.")
+        e_splits_idx = np.array_split(np.arange(len(x_e_orig)), num_splits)
+        f_splits_idx = np.array_split(np.arange(len(x_f_orig)), num_splits)
+
+        # --- NEW: Shared Memory Setup ---
+        shm_list = []
+        shm_metas = {}
+        
+        def _create_shared_array(key: str, arr: np.ndarray):
+            """Helper to create and populate a shared memory block."""
+            # Unique name prevents conflicts between runs
+            name = f"uf3_{key}_{uuid.uuid4().hex}"
+            shm = shared_memory.SharedMemory(create=True, size=arr.nbytes, name=name)
+            shared_arr = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)
+            shared_arr[:] = arr[:]  # Copy data into shared memory
+            shm_list.append(shm)
+            shm_metas[key] = {'name': shm.name, 'shape': arr.shape, 'dtype': arr.dtype}
+
         try:
-            # Save the large arrays to disk to be memory-mapped by workers
-            data_filenames = {
-                'x_e': os.path.join(temp_dir, 'x_e.mmap'),
-                'y_e': os.path.join(temp_dir, 'y_e.mmap'),
-                'x_f': os.path.join(temp_dir, 'x_f.mmap'),
-                'y_f': os.path.join(temp_dir, 'y_f.mmap'),
-            }
-            joblib.dump(prepared_data['x_e'], data_filenames['x_e'])
-            joblib.dump(prepared_data['y_e'], data_filenames['y_e'])
-            joblib.dump(prepared_data['x_f'], data_filenames['x_f'])
-            joblib.dump(prepared_data['y_f'], data_filenames['y_f'])
+            # Create shared memory blocks for all data arrays
+            _create_shared_array("x_e", x_e_orig)
+            _create_shared_array("y_e", y_e_orig)
+            _create_shared_array("x_f", x_f_orig)
+            _create_shared_array("y_f", y_f_orig)
             
-            # ** CRITICAL FIX: Delete in-memory copy before starting workers **
-            del prepared_data
+            # Original arrays can now be released from the main process memory
+            del prepared_data, x_e_orig, y_e_orig, x_f_orig, y_f_orig
             gc.collect()
 
-            # Split the *indices* of the arrays, not the arrays themselves
-            # We need to re-read the shape from the memory-mapped file for safety
-            x_e_len = joblib.load(data_filenames['x_e'], mmap_mode='r').shape[0]
-            x_f_len = joblib.load(data_filenames['x_f'], mmap_mode='r').shape[0]
+            # --- Initialize accumulators (Unchanged) ---
+            gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
+            e_var, f_var = VarianceRecorder(), VarianceRecorder()
 
-            e_idx_splits = np.array_split(np.arange(x_e_len), n_jobs)
-            f_idx_splits = np.array_split(np.arange(x_f_len), n_jobs)
-            
-            job_indices_list = [(e_idx_splits[i], f_idx_splits[i]) for i in range(n_jobs)]
-            
-            model_config = {
-                "mask": self.mask,
-                "frozen_c": self.frozen_c,
-                "col_idx": self.col_idx,
-            }
+            # --- MODIFIED: Batch Processing Loop ---
+            for i in tqdm(range(0, num_splits, n_jobs), desc="Processing Batches"):
+                e_idx_batch = e_splits_idx[i:i + n_jobs]
+                f_idx_batch = f_splits_idx[i:i + n_jobs]
+                
+                # joblib call now passes shared memory metadata and indices instead of raw data
+                results = joblib.Parallel(n_jobs=len(e_idx_batch), backend="loky")(
+                    joblib.delayed(_process_chunk_shared)(
+                        shm_metas,
+                        e_idx,
+                        f_idx,
+                        batch_size,
+                        outlier_config,
+                        self.mask,
+                        self.frozen_c,
+                        self.col_idx
+                    ) for e_idx, f_idx in zip(e_idx_batch, f_idx_batch)
+                )
 
-            print(f"Processing chunks in parallel with '{backend}' backend...")
-            results = joblib.Parallel(n_jobs=n_jobs, backend=backend)(
-                joblib.delayed(_process_numpy_chunk_parallel)(
-                    data_filenames, job_indices, model_config, batch_size, outlier_config
-                ) for job_indices in tqdm(job_indices_list, desc="Processing Chunks", disable=(progress != "bar"))
-            )
+                # --- Aggregate results (Unchanged) ---
+                for result in results:
+                    if result is None: continue
+                    g_e, g_f, o_e, o_f, e_mean, e_std, e_n, f_mean, f_std, f_n = result
+                    gram_e += g_e
+                    gram_f += g_f
+                    ord_e += o_e
+                    ord_f += o_f
+                    e_var.update_manual(e_mean, e_std, e_n)
+                    f_var.update_manual(f_mean, f_std, f_n)
+                gc.collect()
+
         finally:
-            # Clean up the temporary directory and memory-mapped files
-            shutil.rmtree(temp_dir)
+            # --- NEW: Shared Memory Cleanup ---
+            # This block ensures that shared memory is released even if an error occurs.
+            print("Cleaning up shared memory blocks...")
+            for shm in shm_list:
+                shm.close()
+                shm.unlink() # Free the memory block
 
-        # --- Aggregate Results ---
-        gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
-        e_var, f_var = VarianceRecorder(), VarianceRecorder()
-        for result in results:
-            if result is None: continue
-            g_e, g_f, o_e, o_f, e_mean, e_std, e_n, f_mean, f_std, f_n = result
-            gram_e += g_e
-            gram_f += g_f
-            ord_e += o_e
-            ord_f += o_f
-            e_var.update_manual(e_mean, e_std, e_n)
-            f_var.update_manual(f_mean, f_std, f_n)
-
+        # --- Finalize fit (Unchanged) ---
         print("Finalizing fit...")
         e_w, f_w = calc_E_F_weights(e_var.n, f_var.n, e_var.std, f_var.std)
         gram, ord_ = self.combine_weighted_gram(gram_e, gram_f, ord_e, ord_f, e_w, f_w, weight)
         self.fit_with_gram(gram, ord_)
         print("--- Fit complete ---")
+    def _build_collocation_1d(self, knots, degree, r_grid, leading_trim=0, trailing_trim=0):
+        # replace this with your existing basis evaluator for speed.
+        # this version constructs the collocation by probing unit vectors; slow but safe.
+        n_basis = len(knots) - degree - 1 - leading_trim - trailing_trim
+        B = np.zeros((r_grid.size, n_basis))
+        # ndsplines expects full coeff vector length = len(knots) - degree - 1
+        full_n = len(knots) - degree - 1
+        for j in range(n_basis):
+            coeff = np.zeros(full_n)
+            coeff[leading_trim + j] = 1.0
+            s = ndsplines.NDSpline([knots], coeff, degree)
+            B[:, j] = s(r_grid, nus=0)
+        return B
 
-    def _process_numpy_chunk(self, chunk, batch_size, outlier_config):
+    def _coef_slice_2b(self, pair):
+        sizes, offsets = self.bspline_config.get_interaction_partitions()
+        off = offsets[pair]
+        n = sizes[pair]
+        return slice(off, off + n)
+
+    def _basis_support_bounds(self, knots, degree, n_basis, leading_trim=0):
+        # returns [(tL, tR) per local basis index]
+        p = degree
+        # local basis k corresponds to global index g = leading_trim + k
+        # support is [t[g], t[g+p+1]]
+        out = []
+        for k in range(n_basis):
+            g = leading_trim + k
+            out.append((knots[g], knots[g + p + 1]))
+        return out
+
+    def _smoothstep5(self, x):
+        # x in [0,1]
+        return 6*x**5 - 15*x**4 + 10*x**3
+
+    def _u_fit_and_deriv_at(self, knots, degree, coeff_local, leading_trim, r0):
+        # lift local coeffs back to full coeff vector for ndsplines
+        full_n = len(knots) - degree - 1
+        coeff_full = np.zeros(full_n)
+        coeff_full[leading_trim:leading_trim+len(coeff_local)] = coeff_local
+        s = ndsplines.NDSpline([knots], coeff_full, degree)
+        u0 = float(s(r0, nus=0))
+        du0 = float(s(r0, nus=1))
+        return u0, du0
+
+    def postshape_repulsion_2b(
+        self,
+        pair,
+        r_join,
+        delta,
+        mode="power",         # "power" or "exp"
+        power_n=12.0,         # used for "power" as exponent, for "exp" reused as k
+        lam=1e-8,
+        enforce_full_support_only=True,
+        leading_trim=None,
+        trailing_trim=None,
+    ):
+        deg = self.bspline_config.degree
+        knots = np.asarray(self.bspline_config.knots_map[pair])
+        if leading_trim is None:
+            leading_trim = self.bspline_config.leading_trim.get(2, 0)
+        if trailing_trim is None:
+            trailing_trim = self.bspline_config.trailing_trim.get(2, 0)
+
+        sl = self._coef_slice_2b(pair)
+        c_old = self.coefficients[sl].copy()
+        n_basis = c_old.size
+
+        rmin = self.bspline_config.r_min_map[pair]
+        rmax = self.bspline_config.r_max_map[pair]
+
+        # denser near the join to control the blend
+        r_lo = max(rmin, r_join - 3*delta)
+        r_hi = min(rmax, r_join + 3*delta)
+        r_grid = np.concatenate([
+            np.linspace(rmin, r_lo, 200, endpoint=False),
+            np.linspace(r_lo, r_join, 220, endpoint=True),
+            np.linspace(r_join, r_hi, 120, endpoint=True),
+        ])
+
+        B = self._build_collocation_1d(knots, deg, r_grid, leading_trim, trailing_trim)
+        u_fit = B @ c_old
+
+        # match value (and roughly slope) at r_join
+        u0, du0 = self._u_fit_and_deriv_at(knots, deg, c_old, leading_trim, r_join)
+        if mode == "power":
+            # value continuity; optional slope match would imply n = -r_join*du0/u0 if u0>0
+            n = float(power_n)
+            A = u0 if u0 != 0 else 1.0
+            u_rep = A * (r_join / np.clip(r_grid, 1e-6, None))**n
+        elif mode == "exp":
+            k = float(power_n)
+            A = u0
+            u_rep = A * np.exp(-k * (r_grid - r_join))
+        else:
+            raise ValueError("mode must be 'power' or 'exp'")
+
+        x = np.clip((r_join - r_grid)/max(delta, 1e-12), 0.0, 1.0)
+        s = self._smoothstep5(x)
+        u_tgt = s*u_rep + (1.0 - s)*u_fit
+
+        # bounds: coefficients whose support is fully < r_join are forced >= 0
+        lb = np.full(n_basis, -np.inf)
+        if enforce_full_support_only:
+            supports = self._basis_support_bounds(knots, deg, n_basis, leading_trim)
+            for k_local, (tL, tR) in enumerate(supports):
+                if tR <= r_join:
+                    lb[k_local] = 0.0
+        else:
+            # more aggressive: force all coeffs tied to any r < r_join to be >=0
+            supports = self._basis_support_bounds(knots, deg, n_basis, leading_trim)
+            for k_local, (tL, tR) in enumerate(supports):
+                if tL < r_join:
+                    lb[k_local] = 0.0
+
+        # Tikhonov to stay close to old coefficients
+        A_aug = np.vstack([B, np.sqrt(lam)*np.eye(n_basis)])
+        b_aug = np.concatenate([u_tgt, np.sqrt(lam)*c_old])
+
+        sol = scipy.optimize.lsq_linear(
+            A_aug, b_aug,
+            bounds=(lb, np.full(n_basis, np.inf)),
+            lsmr_tol='auto',
+            max_iter=200
+        )
+
+        c_new = sol.x
+        self.coefficients[sl] = c_new
+        return dict(status='ok', pair=pair, iters=sol.nit, cost=sol.cost, active=(lb==0).sum())
+
+    def postshape_repulsion_all_2b(self, r_join, delta, **kwargs):
+        results = {}
+        for pair in self.bspline_config.interactions_map[2]:
+            results[pair] = self.postshape_repulsion_2b(pair, r_join, delta, **kwargs)
+        return results
+    def configure_combined_model_for_fitting(
+        self,
+        potential_paths: List[str],
+        combined_bspline_config: bspline.BSplineBasis
+    ):
         """
-        Helper method to be run in parallel. Operates directly on NumPy arrays.
-        (This should be part of the WeightedLinearModel class).
+        Creates a new model, loads coefficients from existing potentials, and
+        configures the model to freeze those existing coefficients for a new fit.
+
+        Args:
+            potential_paths (List[str]): Paths to existing potential JSON files.
+            combined_bspline_config (bspline.BSplineBasis): The BSpline configuration
+                for the final, combined chemical system.
+
+        Returns:
+            WeightedLinearModel: The new model with pre-trained coefficients loaded
+                and freezing attributes (`col_idx`, `frozen_c`) correctly set.
         """
-        x_e, y_e = chunk["x_e"], chunk["y_e"]
-        x_f, y_f = chunk["x_f"], chunk["y_f"]
-
-        if outlier_config:
-            x_e, y_e = apply_global_filters(x_e, y_e, config=outlier_config)
-            x_f, y_f = apply_global_filters(x_f, y_f, config=outlier_config)
-
-        x_e, y_e = freeze_columns(x_e, y_e, self.mask, self.frozen_c, self.col_idx)
-        x_f, y_f = freeze_columns(x_f, y_f, self.mask, self.frozen_c, self.col_idx)
-
-        gram_e, ord_e = batched_moore_penrose(x_e, y_e, batch_size)
-        gram_f, ord_f = batched_moore_penrose(x_f, y_f, batch_size)
+        print("\n--- Configuring a new combined model ---")
+        # 1. Initialize the target model with all coefficients as zero
+        combined_model = WeightedLinearModel(bspline_config=combined_bspline_config)
+        combined_model.coefficients = np.zeros(combined_model.n_feats)
         
-        ev, fv = VarianceRecorder(), VarianceRecorder()
-        if len(y_e) > 0: ev.update(y_e)
-        if len(y_f) > 0: fv.update(y_f)
+        _, combined_offsets = combined_bspline_config.get_interaction_partitions()
+        
+        # 2. Load coefficients and identify which interactions to freeze
+        print(f"Loading coefficients from {len(potential_paths)} potential file(s)...")
+        populated_interactions = set()
+        for path in potential_paths:
+            try:
+                with open(path, 'r') as f:
+                    data = json.load(f)
+                source_coeffs_map = data.get('coefficients', {})
 
-        return (gram_e, gram_f, ord_e, ord_f, ev.mean, ev.std, ev.n, fv.mean, fv.std, fv.n)
+                for key_str, coeffs in source_coeffs_map.items():
+                    key_tuple = tuple(sorted(composition.get_interaction_tuple(key_str)))
+                    if key_tuple in combined_offsets:
+                        offset = combined_offsets[key_tuple]
+                        size = len(np.atleast_1d(coeffs))
+                        combined_model.coefficients[offset : offset + size] = coeffs
+                        populated_interactions.add(key_tuple)
+            except Exception as e:
+                print(f"Warning: Could not process {path}. Skipping. Error: {e}")
+
+        # 3. Build the lists of frozen indices and their corresponding values
+        print("Setting up freezing for populated coefficients...")
+        frozen_indices = []
+        frozen_values = []
+        
+        for interaction in sorted(list(populated_interactions)):
+            if interaction in combined_offsets:
+                offset = combined_offsets[interaction]
+                size = combined_bspline_config.get_interaction_partitions()[0][interaction]
+                indices = range(offset, offset + size)
+                
+                frozen_indices.extend(indices)
+                frozen_values.extend(combined_model.coefficients[indices])
+
+        # 4. Set the freezing attributes on the model's configuration
+        combined_model.bspline_config.col_idx = np.array(frozen_indices, dtype=int)
+        combined_model.bspline_config.frozen_c = np.array(frozen_values, dtype=float)
+        
+        n_frozen = len(frozen_indices)
+        n_total = combined_model.n_feats
+        print(f"Configuration complete. {n_frozen}/{n_total} coefficients will be frozen.")
+        
+        return combined_model
     def load_and_prepare_data(
         self,
         filenames: List[str],
@@ -1006,29 +1203,21 @@ class WeightedLinearModel(BasicLinearModel):
         sample_weights: Dict = None,
         energy_key: str = "energy",
         num_cores: int = -1,
-        progress: str = "bar"
+        progress: str = "bar",
+        dtype: np.dtype = np.float64,
+        use_memmap: bool = False,
+        memmap_dir: Optional[str] = '/blue/ypchen/ntaormina/uf3/AlN/test_auto/UF3-Tools/algan/memmap',
+        max_in_flight: Optional[int] = None,
     ) -> Dict[str, np.ndarray]:
-        """
-        Loads data from HDF5 files directly into pre-allocated NumPy arrays.
-        This version uses a two-pass strategy to be highly memory-efficient:
-        1. A lightweight first pass scans table metadata to calculate the total size.
-        2. A second pass loads each table *sequentially* to prevent memory spikes,
-           copies its data, and immediately discards it.
-
-        Returns:
-            Dict[str, np.ndarray]: A dictionary containing the prepared NumPy arrays
-                                   ('x_e', 'y_e', 'x_f', 'y_f').
-        """
         if num_cores == -1:
             num_cores = os.cpu_count() or 1
-            
-        print("--- Starting Data Load and Preparation (Memory-Optimized) ---")
-        # log_total_memory("Initial state")
+        if max_in_flight is None:
+            max_in_flight = min(4, max(1, num_cores))  # keep tiny inside Dask workers
 
-        # --- 1. Discover all table jobs ---
+        # discover tables
         table_jobs = []
         for fname in filenames:
-            if not os.path.isfile(fname):
+            if not os.path.isfile(fname): 
                 warnings.warn(f"File not found, skipping: {fname}")
                 continue
             try:
@@ -1037,100 +1226,109 @@ class WeightedLinearModel(BasicLinearModel):
                 table_jobs.extend([(fname, tname) for tname in table_names])
             except Exception as e:
                 warnings.warn(f"Could not analyze HDF5 file {fname}: {e}")
-
         if not table_jobs:
-            raise ValueError("No tables found in any of the provided files.")
+            raise ValueError("No tables found.")
 
-        # --- 2. Lightweight Pre-scan to determine total dimensions ---
-        print("Pre-scanning tables to determine total data size...")
-        total_e_rows, total_f_rows, n_features = 0, 0, 0
-        
-        # Determine n_features from the first valid table
-        for job in table_jobs:
-            # Assuming process is imported from uf3.representation
-            temp_df = process.load_feature_db(job[0], job[1], subset)
-            if temp_df is not None and not temp_df.empty:
-                n_features = len(temp_df.columns) - 1
-                break
+        # pass 1: counts per job
+        job_meta = []  # (job, e_cnt, f_cnt)
+        n_features = 0
+        pbar = tqdm(table_jobs, desc="Scanning") if progress == "bar" else table_jobs
+        for job in pbar:
+            df = process.load_feature_db(job[0], job[1], subset)  # must close files inside
+            e_cnt, f_cnt, nf = _count_rows(df, energy_key)
+            if nf and n_features == 0:
+                n_features = nf
+            job_meta.append((job, e_cnt, f_cnt))
+            del df
+            if len(job_meta) % 8 == 0:
+                gc.collect()
         if n_features == 0:
-            raise ValueError("Could not determine feature dimensions from the provided subset.")
-        del temp_df
+            raise ValueError("No features detected.")
 
-        # Function for the pre-scan worker threads
-        def _scan_chunk_size(job):
-            df_scan = process.load_feature_db(job[0], job[1], subset)
-            if df_scan is None or df_scan.empty:
-                return 0, 0
-            index = df_scan.index
-            e_count = (index.get_level_values(-1) == energy_key).sum()
-            f_count = len(index) - e_count
-            return e_count, f_count
+        # offsets
+        e_offsets, f_offsets = {}, {}
+        e_total = f_total = 0
+        for job, e_cnt, f_cnt in job_meta:
+            e_offsets[job] = e_total
+            f_offsets[job] = f_total
+            e_total += e_cnt
+            f_total += f_cnt
 
-        with ThreadPoolExecutor(max_workers=num_cores) as executor:
-            future_to_job = {executor.submit(_scan_chunk_size, job): job for job in table_jobs}
-            pbar = tqdm(as_completed(future_to_job), total=len(future_to_job), desc="Scanning table sizes")
-            for future in pbar:
-                try:
-                    e_count, f_count = future.result()
-                    total_e_rows += e_count
-                    total_f_rows += f_count
-                except Exception as e:
-                    job_info = future_to_job[future]
-                    warnings.warn(f"Failed to scan table {job_info[0]}:{job_info[1]}: {e}")
+        # allocate finals
+        def _alloc(path, shape, dt):
+            if use_memmap:
+                if not memmap_dir:
+                    raise ValueError("memmap_dir must be set when use_memmap=True")
+                os.makedirs(memmap_dir, exist_ok=True)
+                return np.memmap(os.path.join(memmap_dir, path), mode="w+", dtype=dt, shape=shape)
+            return np.zeros(shape, dtype=dt)
 
-        if total_e_rows == 0 and total_f_rows == 0:
-            raise ValueError("No data found for the given subset.")
+        x_e_final = _alloc("x_e.dat", (e_total, n_features), dtype)
+        y_e_final = _alloc("y_e.dat", (e_total,), dtype)
+        x_f_final = _alloc("x_f.dat", (f_total, n_features), dtype)
+        y_f_final = _alloc("y_f.dat", (f_total,), dtype)
 
-        print(f"Allocation plan: {total_e_rows} energy rows, {total_f_rows} force rows, {n_features} features.")
-
-        # --- 3. Pre-allocate final NumPy arrays ---
-        x_e_final = np.zeros((total_e_rows, n_features), dtype=np.float64)
-        y_e_final = np.zeros(total_e_rows, dtype=np.float64)
-        x_f_final = np.zeros((total_f_rows, n_features), dtype=np.float64)
-        y_f_final = np.zeros(total_f_rows, dtype=np.float64)
-        
-        # log_total_memory("After pre-allocating NumPy arrays")
-
-        # --- 4. Second Pass: SEQUENTIAL Load and Fill to minimize memory ---
-        print("Filling final arrays sequentially to conserve memory...")
-        e_cursor, f_cursor = 0, 0
         n_elements = len(self.bspline_config.element_list)
 
-        for job in tqdm(table_jobs, desc="Loading and filling data"):
-            try:
-                # Load one DataFrame at a time
-                df_chunk = process.load_feature_db(job[0], job[1], subset)
-                if df_chunk is None or df_chunk.empty:
-                    continue
+        # pass 2: bounded in-flight, fill by offsets
+        def _load(job):
+            df = process.load_feature_db(job[0], job[1], subset)
+            return job, df
 
-                x_e, y_e, x_f, y_f = dataframe_to_tuples(
-                    df_chunk, n_elements, energy_key, sample_weights
-                )
-                
-                e_len = len(y_e)
-                if e_len > 0:
-                    x_e_final[e_cursor : e_cursor + e_len, :] = x_e
-                    y_e_final[e_cursor : e_cursor + e_len] = y_e
-                    e_cursor += e_len
-                
-                f_len = len(y_f)
-                if f_len > 0:
-                    x_f_final[f_cursor : f_cursor + f_len, :] = x_f
-                    y_f_final[f_cursor : f_cursor + f_len] = y_f
-                    f_cursor += f_len
-                
-                # Explicitly delete the DataFrame to help free memory immediately
-                del df_chunk
-                
-            except Exception as e:
-                warnings.warn(f"Failed processing chunk {job[0]}:{job[1]}: {e}")
-        
-        # A single garbage collect after the loop can be helpful
+        jobs_nonempty = [j for j, e_cnt, f_cnt in job_meta if (e_cnt + f_cnt) > 0]
+        submit_iter = iter(jobs_nonempty)
+        processed = 0
+        total = len(jobs_nonempty)
+
+        with ThreadPoolExecutor(max_workers=max_in_flight) as ex:
+            futures = {}
+            for _ in range(min(max_in_flight, total)):
+                j = next(submit_iter, None)
+                if j is None:
+                    break
+                futures[ex.submit(_load, j)] = True
+
+            pbar2 = tqdm(total=total, desc="Filling arrays") if progress == "bar" else None
+            while futures:
+                for fut in as_completed(list(futures)):
+                    futures.pop(fut, None)
+                    job, df_chunk = fut.result()
+
+                    if df_chunk is not None and not df_chunk.empty:
+                        # ensure dataframe_to_tuples returns arrays already in 'dtype'
+                        x_e, y_e, x_f, y_f = dataframe_to_tuples(
+                            df_chunk, n_elements, energy_key, sample_weights
+                        )
+                        e_off = e_offsets[job]; f_off = f_offsets[job]
+                        e_len = len(y_e); f_len = len(y_f)
+
+                        if e_len:
+                            np.copyto(x_e_final[e_off:e_off+e_len, :], x_e, casting='no')
+                            np.copyto(y_e_final[e_off:e_off+e_len], y_e, casting='no')
+                        if f_len:
+                            np.copyto(x_f_final[f_off:f_off+f_len, :], x_f, casting='no')
+                            np.copyto(y_f_final[f_off:f_off+f_len], y_f, casting='no')
+
+                        del df_chunk, x_e, y_e, x_f, y_f
+
+                    processed += 1
+                    if pbar2:
+                        pbar2.update(1)
+
+                    nxt = next(submit_iter, None)
+                    if nxt is not None:
+                        futures[ex.submit(_load, nxt)] = True
+
+                    if processed % 4 == 0:
+                        gc.collect()
+
+            if pbar2:
+                pbar2.close()
+
         gc.collect()
-
-        # log_total_memory("After filling arrays")
-        print("--- Data Preparation Complete ---")
         return {"x_e": x_e_final, "y_e": y_e_final, "x_f": x_f_final, "y_f": y_f_final}
+
+
     
     def load_tables_parallel(
         self,
@@ -2824,3 +3022,190 @@ def restore_feature_columns(X, full_dim):
     X_full = np.zeros((X.shape[0], full_dim), dtype=X.dtype)
     X_full[:, :X.shape[1]] = X
     return X_full
+
+def _process_numpy_chunk(chunk, batch_size, outlier_config, mask, frozen_c, col_idx):
+        """
+        Helper method to be run in parallel. Operates directly on NumPy arrays.
+        (This should be part of the WeightedLinearModel class).
+        """
+        x_e, y_e = chunk["x_e"], chunk["y_e"]
+        x_f, y_f = chunk["x_f"], chunk["y_f"]
+
+        if outlier_config:
+            x_e, y_e = apply_global_filters(x_e, y_e, config=outlier_config)
+            x_f, y_f = apply_global_filters(x_f, y_f, config=outlier_config)
+
+        x_e, y_e = freeze_columns(x_e, y_e, mask, frozen_c, col_idx)
+        x_f, y_f = freeze_columns(x_f, y_f, mask, frozen_c, col_idx)
+
+        gram_e, ord_e = batched_moore_penrose(x_e, y_e, batch_size)
+        gram_f, ord_f = batched_moore_penrose(x_f, y_f, batch_size)
+        
+        ev, fv = VarianceRecorder(), VarianceRecorder()
+        if len(y_e) > 0: ev.update(y_e)
+        if len(y_f) > 0: fv.update(y_f)
+
+        return (gram_e, gram_f, ord_e, ord_f, ev.mean, ev.std, ev.n, fv.mean, fv.std, fv.n)
+    
+def _count_rows(df, energy_key: str) -> Tuple[int, int, int]:
+    if df is None or df.empty:
+        return 0, 0, 0
+    idx = df.index
+    e = (idx.get_level_values(-1) == energy_key).sum()
+    f = len(idx) - e
+    nfeat = len(df.columns) - 1
+    return e, f, nfeat
+
+def _process_numpy_chunk_mm(
+    e_path, f_path, y_e_path, y_f_path,  # memmap file paths
+    e_shape, f_shape, ye_shape, yf_shape,
+    e_range, f_range,
+    batch_size,
+    outlier_config,
+    mask,
+    frozen_c,
+    col_idx,
+):
+    # open read-only memmaps in the child; zero copy across batches
+    x_e = np.memmap(e_path, dtype=np.float64, mode="r", shape=e_shape)
+    x_f = np.memmap(f_path, dtype=np.float64, mode="r", shape=f_shape)
+    y_e = np.memmap(y_e_path, dtype=np.float64, mode="r", shape=ye_shape)
+    y_f = np.memmap(y_f_path, dtype=np.float64, mode="r", shape=yf_shape)
+
+    e0, e1 = e_range
+    f0, f1 = f_range
+
+    xe = x_e[e0:e1]  # contiguous view from memmap
+    xf = x_f[f0:f1]
+    ye = y_e[e0:e1]
+    yf = y_f[f0:f1]
+
+    # do the same math you had before; keep temps scoped
+    return _process_numpy_chunk(xe, ye, xf, yf, batch_size, outlier_config, mask, frozen_c, col_idx)
+
+def _process_numpy_chunk_shared(
+    x_e_full: np.ndarray,
+    y_e_full: np.ndarray,
+    x_f_full: np.ndarray,
+    y_f_full: np.ndarray,
+    e_indices: np.ndarray,
+    f_indices: np.ndarray,
+    col_idx: np.ndarray,
+    batch_size: int,
+    outlier_config: Optional[Dict],
+    mask: np.ndarray,
+    frozen_c: np.ndarray,
+) -> Optional[tuple]:
+    """
+    Processes a data chunk from shared memory, applies column selection,
+    and computes the Gram matrices and ordinate vectors.
+    """
+    # 1. Slice the necessary rows from the full shared-memory arrays
+    x_e, y_e = x_e_full[e_indices], y_e_full[e_indices]
+    x_f, y_f = x_f_full[f_indices], y_f_full[f_indices]
+
+    # Early exit if this chunk contains no data
+    if x_e.size == 0 and x_f.size == 0:
+        return None
+
+    # 2. Efficiently create the column selection mask ONCE
+    # This mask will select all columns EXCEPT those specified in col_idx
+    n_features_total = x_e_full.shape[1]
+    selection_mask = np.ones(n_features_total, dtype=bool)
+    selection_mask[col_idx] = False
+    n_cols_selected = int(mask.sum())
+    print("columns selected:", n_cols_selected)
+
+    # Initialize all outputs with the correct final shapes
+    g_e = np.zeros((n_cols_selected, n_cols_selected), dtype=np.float64)
+    o_e = np.zeros(n_cols_selected, dtype=np.float64)
+    g_f = np.zeros((n_cols_selected, n_cols_selected), dtype=np.float64)
+    o_f = np.zeros(n_cols_selected, dtype=np.float64)
+    e_mean, e_std, e_n = 0.0, 0.0, 0
+    f_mean, f_std, f_n = 0.0, 0.0, 0
+
+    # 4. Process E-type data if it exists
+    if x_e.size > 0:
+        # BUG FIX: Apply the selection mask and use the RESULTING array
+        x_e_selected = x_e[:, mask]
+        
+        # Perform calculations on the correctly-shaped `x_e_selected`
+        g_e = x_e_selected.T @ x_e_selected
+        o_e = x_e_selected.T @ y_e
+        e_mean, e_std, e_n = y_e.mean(), y_e.std(), len(y_e)
+
+    # 5. Process F-type data if it exists
+    if x_f.size > 0:
+        # BUG FIX: Apply the selection mask and use the RESULTING array
+        x_f_selected = x_f[:, mask]
+
+        # Perform calculations on the correctly-shaped `x_f_selected`
+        g_f = x_f_selected.T @ x_f_selected
+        o_f = x_f_selected.T @ y_f
+        f_mean, f_std, f_n = y_f.mean(), y_f.std(), len(y_f)
+
+    return (g_e, g_f, o_e, o_f, e_mean, e_std, e_n, f_mean, f_std, f_n)
+
+
+# This is the CORRECTED worker function.
+def _process_chunk_shared(shm_metas, e_indices, f_indices, batch_size, 
+                          outlier_config, mask, frozen_c, col_idx):
+    """
+    Connects to shared memory and processes a chunk of data. This version
+    reconstructs arrays explicitly to ensure correctness.
+    """
+    shms_to_close = []
+    try:
+        # --- Explicitly reconstruct each array from shared memory ---
+        # This is safer than a generalized loop and prevents misalignment.
+
+        # Connect to x_e and get the specific slice for this worker
+        shm_x_e = shared_memory.SharedMemory(name=shm_metas['x_e']['name'])
+        print("name: ", shm_metas['x_e']['name'])
+        shms_to_close.append(shm_x_e)
+        full_x_e = np.ndarray(shm_metas['x_e']['shape'], dtype=shm_metas['x_e']['dtype'], buffer=shm_x_e.buf)
+        x_e = full_x_e[e_indices]
+
+        # Connect to y_e and get slice
+        shm_y_e = shared_memory.SharedMemory(name=shm_metas['y_e']['name'])
+        shms_to_close.append(shm_y_e)
+        full_y_e = np.ndarray(shm_metas['y_e']['shape'], dtype=shm_metas['y_e']['dtype'], buffer=shm_y_e.buf)
+        y_e = full_y_e[e_indices]
+
+        # Connect to x_f and get slice
+        shm_x_f = shared_memory.SharedMemory(name=shm_metas['x_f']['name'])
+        shms_to_close.append(shm_x_f)
+        full_x_f = np.ndarray(shm_metas['x_f']['shape'], dtype=shm_metas['x_f']['dtype'], buffer=shm_x_f.buf)
+        x_f = full_x_f[f_indices]
+
+        # Connect to y_f and get slice
+        shm_y_f = shared_memory.SharedMemory(name=shm_metas['y_f']['name'])
+        shms_to_close.append(shm_y_f)
+        full_y_f = np.ndarray(shm_metas['y_f']['shape'], dtype=shm_metas['y_f']['dtype'], buffer=shm_y_f.buf)
+        y_f = full_y_f[f_indices]
+
+        # --- The original processing logic (now guaranteed to have correct data) ---
+        if outlier_config:
+            x_e, y_e = apply_global_filters(x_e, y_e, config=outlier_config)
+            x_f, y_f = apply_global_filters(x_f, y_f, config=outlier_config)
+
+        x_e, y_e = freeze_columns(x_e, y_e, mask, frozen_c, col_idx)
+        x_f, y_f = freeze_columns(x_f, y_f, mask, frozen_c, col_idx)
+
+        gram_e, ord_e = batched_moore_penrose(x_e, y_e, batch_size)
+        gram_f, ord_f = batched_moore_penrose(x_f, y_f, batch_size)
+        
+        ev = VarianceRecorder()
+        if y_e.size:
+            ev.update(y_e.ravel())  # 1D
+
+        # forces: count per-component, not per-row
+        fv = VarianceRecorder()
+        if y_f.size:
+            fv.update(y_f.reshape(-1))  # 1D over all components
+
+        # now ev.std, fv.std are scalars and ev.n, fv.n count true samples
+        return (gram_e, gram_f, ord_e, ord_f, ev.mean, ev.std, ev.n, fv.mean, fv.std, fv.n)
+    finally:
+        for shm in shms_to_close:
+            shm.close()
