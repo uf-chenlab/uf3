@@ -886,7 +886,6 @@ class WeightedLinearModel(BasicLinearModel):
         progress: str = "bar",
         backend: str = "loky",
         exclude_elements: List[str] = None,
-        threads_per_worker: int = 4,
         outlier_config: Dict = None,
         max_chunk_size: int = 10000
     ):
