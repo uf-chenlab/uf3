@@ -39,7 +39,8 @@ class ChemicalSystem:
 
     def __init__(self,
                  element_list: Collection[str],
-                 degree: int = 2
+                 degree: int = 2,
+                 interactions_map: Dict = None
                  ) -> None:
         """
         Args:
@@ -53,7 +54,10 @@ class ChemicalSystem:
                                                      fix_first=False)
         self.numbers = [ase_symbols.symbols2numbers(el).pop()
                         for el in self.element_list]
-        self.interactions_map = self.get_interactions_map()
+        if interactions_map is not None:
+            self.interactions_map = interactions_map
+        else:
+            self.interactions_map = self.get_interactions_map()
         self.interactions = self.get_interactions_list()
         self.interaction_hashes = self.get_interaction_hashes()
 

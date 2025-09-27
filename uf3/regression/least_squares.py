@@ -736,7 +736,9 @@ class WeightedLinearModel(BasicLinearModel):
                                                 style=progress)
         for j in table_iterator:
             table_name = table_names[j]
-            df = process.load_feature_db(filenames_list[j], table_name)
+            df = process.load_feature_db(filenames_list[j], table_name, subset)
+            if df is None:
+                continue
             keys = df.index.unique(level=0).intersection(subset)
             if len(keys) == 0:
                 continue
@@ -993,135 +995,79 @@ class WeightedLinearModel(BasicLinearModel):
         gram, ord_ = self.combine_weighted_gram(gram_e, gram_f, ord_e, ord_f, e_w, f_w, weight)
         self.fit_with_gram(gram, ord_)
         print("--- Fit complete ---")
-    def _build_collocation_1d(self, knots, degree, r_grid, leading_trim=0, trailing_trim=0):
-        # replace this with your existing basis evaluator for speed.
-        # this version constructs the collocation by probing unit vectors; slow but safe.
-        n_basis = len(knots) - degree - 1 - leading_trim - trailing_trim
-        B = np.zeros((r_grid.size, n_basis))
-        # ndsplines expects full coeff vector length = len(knots) - degree - 1
-        full_n = len(knots) - degree - 1
-        for j in range(n_basis):
-            coeff = np.zeros(full_n)
-            coeff[leading_trim + j] = 1.0
-            s = ndsplines.NDSpline([knots], coeff, degree)
-            B[:, j] = s(r_grid, nus=0)
-        return B
-
     def _coef_slice_2b(self, pair):
         sizes, offsets = self.bspline_config.get_interaction_partitions()
         off = offsets[pair]
         n = sizes[pair]
         return slice(off, off + n)
 
-    def _basis_support_bounds(self, knots, degree, n_basis, leading_trim=0):
-        # returns [(tL, tR) per local basis index]
+    def _indexing_2b(self, pair):
+        deg = self.bspline_config.degree
+        knots = np.asarray(self.bspline_config.knots_map[pair])
+        full_n = len(knots) - deg - 1
+        sl = self._coef_slice_2b(pair)
+        n_basis = sl.stop - sl.start
+        lead = self.bspline_config.leading_trim.get(2, 0)
+        trail = max(0, full_n - lead - n_basis)  # derive; ensures lead + n_basis + trail == full_n
+        return knots, deg, sl, n_basis, full_n, lead, trail
+
+    def _build_collocation_1d(self, knots, degree, r_grid, full_n, lead, n_basis):
+        # columns correspond to local indices 0..n_basis-1; mapped to global = lead + j
+        B = np.zeros((r_grid.size, n_basis))
+        for j in range(n_basis):
+            coeff = np.zeros(full_n)
+            coeff[lead + j] = 1.0
+            s = ndsplines.NDSpline([knots], coeff, degree)
+            B[:, j] = s(r_grid, nus=0)
+        return B
+
+    def _u_fit_and_deriv_at(self, knots, degree, c_local, full_n, lead, r0):
+        coeff_full = np.zeros(full_n)
+        coeff_full[lead:lead + len(c_local)] = c_local
+        s = ndsplines.NDSpline([knots], coeff_full, degree)
+        return float(s(r0, nus=0)), float(s(r0, nus=1))
+
+    def _basis_support_bounds(self, knots, degree, n_basis, lead):
         p = degree
-        # local basis k corresponds to global index g = leading_trim + k
-        # support is [t[g], t[g+p+1]]
         out = []
         for k in range(n_basis):
-            g = leading_trim + k
+            g = lead + k
             out.append((knots[g], knots[g + p + 1]))
         return out
 
-    def _smoothstep5(self, x):
-        # x in [0,1]
-        return 6*x**5 - 15*x**4 + 10*x**3
 
-    def _u_fit_and_deriv_at(self, knots, degree, coeff_local, leading_trim, r0):
-        # lift local coeffs back to full coeff vector for ndsplines
-        full_n = len(knots) - degree - 1
-        coeff_full = np.zeros(full_n)
-        coeff_full[leading_trim:leading_trim+len(coeff_local)] = coeff_local
-        s = ndsplines.NDSpline([knots], coeff_full, degree)
-        u0 = float(s(r0, nus=0))
-        du0 = float(s(r0, nus=1))
-        return u0, du0
+    def postshape_repulsion_2b(self, pair, r_join, target=15.0, smooth_span=0.2):
 
-    def postshape_repulsion_2b(
-        self,
-        pair,
-        r_join,
-        delta,
-        mode="power",         # "power" or "exp"
-        power_n=12.0,         # used for "power" as exponent, for "exp" reused as k
-        lam=1e-8,
-        enforce_full_support_only=True,
-        leading_trim=None,
-        trailing_trim=None,
-    ):
         deg = self.bspline_config.degree
         knots = np.asarray(self.bspline_config.knots_map[pair])
-        if leading_trim is None:
-            leading_trim = self.bspline_config.leading_trim.get(2, 0)
-        if trailing_trim is None:
-            trailing_trim = self.bspline_config.trailing_trim.get(2, 0)
-
-        sl = self._coef_slice_2b(pair)
+        sizes, offsets = self.bspline_config.get_interaction_partitions()
+        off = offsets[pair]
+        n_basis = sizes[pair]
+        sl = slice(off, off + n_basis)
         c_old = self.coefficients[sl].copy()
-        n_basis = c_old.size
 
-        rmin = self.bspline_config.r_min_map[pair]
-        rmax = self.bspline_config.r_max_map[pair]
+        # spline "centers" are knot averages for B-splines of degree p
+        r_centers = 0.5 * (knots[deg:-deg] + knots[deg+1:-deg+1])[:n_basis]
 
-        # denser near the join to control the blend
-        r_lo = max(rmin, r_join - 3*delta)
-        r_hi = min(rmax, r_join + 3*delta)
-        r_grid = np.concatenate([
-            np.linspace(rmin, r_lo, 200, endpoint=False),
-            np.linspace(r_lo, r_join, 220, endpoint=True),
-            np.linspace(r_join, r_hi, 120, endpoint=True),
-        ])
+        # find index of the basis center just below the cutoff
+        idx_cut = np.searchsorted(r_centers, r_join) - 1
+        if idx_cut < 0:
+            idx_cut = 0
 
-        B = self._build_collocation_1d(knots, deg, r_grid, leading_trim, trailing_trim)
-        u_fit = B @ c_old
+        # everything shorter → target value
+        c_new = c_old.copy()
+        c_new[:idx_cut+1] = target
 
-        # match value (and roughly slope) at r_join
-        u0, du0 = self._u_fit_and_deriv_at(knots, deg, c_old, leading_trim, r_join)
-        if mode == "power":
-            # value continuity; optional slope match would imply n = -r_join*du0/u0 if u0>0
-            n = float(power_n)
-            A = u0 if u0 != 0 else 1.0
-            u_rep = A * (r_join / np.clip(r_grid, 1e-6, None))**n
-        elif mode == "exp":
-            k = float(power_n)
-            A = u0
-            u_rep = A * np.exp(-k * (r_grid - r_join))
-        else:
-            raise ValueError("mode must be 'power' or 'exp'")
+        # smooth over the next 2 basis functions
+        n_smooth = min(2, n_basis - (idx_cut+1))
+        for i in range(1, n_smooth+1):
+            frac = i / (n_smooth+1)  # 1/3, 2/3 for two steps
+            c_new[idx_cut+i] = (1-frac)*target + frac*c_old[idx_cut+i]
 
-        x = np.clip((r_join - r_grid)/max(delta, 1e-12), 0.0, 1.0)
-        s = self._smoothstep5(x)
-        u_tgt = s*u_rep + (1.0 - s)*u_fit
-
-        # bounds: coefficients whose support is fully < r_join are forced >= 0
-        lb = np.full(n_basis, -np.inf)
-        if enforce_full_support_only:
-            supports = self._basis_support_bounds(knots, deg, n_basis, leading_trim)
-            for k_local, (tL, tR) in enumerate(supports):
-                if tR <= r_join:
-                    lb[k_local] = 0.0
-        else:
-            # more aggressive: force all coeffs tied to any r < r_join to be >=0
-            supports = self._basis_support_bounds(knots, deg, n_basis, leading_trim)
-            for k_local, (tL, tR) in enumerate(supports):
-                if tL < r_join:
-                    lb[k_local] = 0.0
-
-        # Tikhonov to stay close to old coefficients
-        A_aug = np.vstack([B, np.sqrt(lam)*np.eye(n_basis)])
-        b_aug = np.concatenate([u_tgt, np.sqrt(lam)*c_old])
-
-        sol = scipy.optimize.lsq_linear(
-            A_aug, b_aug,
-            bounds=(lb, np.full(n_basis, np.inf)),
-            lsmr_tol='auto',
-            max_iter=200
-        )
-
-        c_new = sol.x
         self.coefficients[sl] = c_new
-        return dict(status='ok', pair=pair, iters=sol.nit, cost=sol.cost, active=(lb==0).sum())
+        return {"pair": pair, "cut_index": idx_cut, "n_smooth": n_smooth}
+
+
 
     def postshape_repulsion_all_2b(self, r_join, delta, **kwargs):
         results = {}
@@ -1234,6 +1180,8 @@ class WeightedLinearModel(BasicLinearModel):
         pbar = tqdm(table_jobs, desc="Scanning") if progress == "bar" else table_jobs
         for job in pbar:
             df = process.load_feature_db(job[0], job[1], subset)  # must close files inside
+            print(f"--- DEBUG loaded df {df.shape}  ")
+
             e_cnt, f_cnt, nf = _count_rows(df, energy_key)
             if nf and n_features == 0:
                 n_features = nf
@@ -2725,7 +2673,7 @@ def batched_prediction(model: WeightedLinearModel,
             drop_columns_final = drop_columns + drop_columns_final
         if drop_columns_final:
             df.drop(columns=drop_columns_final, inplace=True)
-
+        print("Predicting on chunk with shape:", df.shape)
         results = subset_prediction(df, model, subset_keys=subset_keys, **kwargs)
         y_e.extend(results[0])
         p_e.extend(results[1])

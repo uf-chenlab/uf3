@@ -12,10 +12,13 @@ import pandas as pd
 from uf3.representation import distances
 from uf3.representation import angles
 from uf3.representation import bspline
+from uf3.representation.bspline import BSplineBasis 
+from uf3.data import composition
 from uf3.data import io
 from uf3.data import geometry
 from uf3.util import parallel
-
+import json
+from typing import List, Set, Tuple, Dict, Any
 
 class BasisFeaturizer:
     """
@@ -535,7 +538,65 @@ class BasisFeaturizer:
                                                energy_key=energy_key)
         return x, y, w
 
+class DeltaBasisFeaturizer(BasisFeaturizer):
+    """
+    A BasisFeaturizer that only featurizes the difference between a target
+    chemical system and a set of existing chemical systems.
+    This version creates a new BSplineBasis object to ensure consistency.
+    """
+    def __init__(self,
+                 bspline_config: BSplineBasis,
+                 existing_potentials: List[str],
+                 **kwargs):
 
+        # --- Step 1: Determine the new "delta" interactions ---
+        known_interactions = set()
+        for path in existing_potentials:
+            with open(path, 'r') as f:
+                config_dict = json.load(f)
+            for key in ['knots_map', 'r_min_map', 'r_max_map', 'resolution_map']:
+                if key in config_dict:
+                    config_dict[key] = decode_interaction_map(config_dict[key])
+            existing_config = BSplineBasis.from_config(config_dict)
+            known_interactions.update(get_interactions_from_config(existing_config))
+
+        target_interactions = get_interactions_from_config(bspline_config)
+        new_interactions = target_interactions - known_interactions
+        
+        print("--- Delta Featurization ---")
+        print(f"Identifying {len(new_interactions)} new interactions to featurize.")
+
+        # --- Step 2: Create a brand new BSplineBasis object ---
+        # This object will initially contain ALL interactions for the chemical system.
+        delta_bspline_config = BSplineBasis(
+            chemical_system=bspline_config.chemical_system,
+            r_min_map=bspline_config.r_min_map,
+            r_max_map=bspline_config.r_max_map,
+            resolution_map=bspline_config.resolution_map,
+            knot_strategy=bspline_config.knot_strategy,
+            leading_trim=bspline_config.leading_trim,
+            trailing_trim=bspline_config.trailing_trim
+        )
+
+        # --- Step 3: Manually overwrite the interactions map with the delta terms ---
+        delta_interactions_map = {1: bspline_config.interactions_map.get(1, [])}
+        for degree in [2, 3]:
+            delta_interactions_map[degree] = [
+                inter for inter in bspline_config.interactions_map.get(degree, []) 
+                if inter in new_interactions
+            ]
+            print(f"New {degree}-body terms: {delta_interactions_map[degree]}")
+
+        # Overwrite the map on the NEW object
+        delta_bspline_config.chemical_system.interactions = \
+            delta_bspline_config.chemical_system.get_interactions_list()
+        
+        # Now, update the rest of the object's state
+        delta_bspline_config.update_basis_functions()
+        
+        # --- Step 4: Initialize the parent class ---
+        super().__init__(delta_bspline_config, **kwargs)
+        print("--------------------------")
 def save_feature_db(dataframe, filename, table_name='features'):
     """
     Save dataframe with sqlite.
@@ -631,3 +692,97 @@ def flatten_by_interactions(vector_map, pair_tuples):
             in order of occurrence in pair_tuples.
     """
     return np.concatenate([vector_map[pair] for pair in pair_tuples], axis=-1)
+
+def decode_interaction_map(imap: Dict[str, Any]) -> Dict[Tuple[str, ...], Any]:
+    """
+    Converts a dictionary with string keys like "Al-N" back into a
+    dictionary with tuple keys like ("Al", "N"). This is the inverse
+    of what happens when the model JSON is saved.
+    """
+    if not imap:
+        return {}
+    # Check if keys are already tuples
+    first_key = next(iter(imap.keys()))
+    if isinstance(first_key, tuple):
+        return imap # No conversion needed
+    
+    new_map = {}
+    for key, value in imap.items():
+        # Handles integer keys for trim dictionaries
+        try:
+            new_key = int(key)
+            new_map[new_key] = value
+        except ValueError:
+            new_key = tuple(key.split('-'))
+            new_map[new_key] = value
+    return new_map
+
+# --- Corrected Helper Function ---
+def get_interactions_from_config(config: BSplineBasis) -> Set[Tuple]:
+    """Helper function to extract a set of interaction tuples from a config."""
+    interactions = set()
+    for degree in [2, 3]:
+        if degree in config.chemical_system.interactions_map:
+            for interaction in config.chemical_system.interactions_map[degree]:
+                interactions.add(interaction)
+    return interactions
+
+
+def get_delta_bspline_config(
+    full_bspline_config: BSplineBasis,
+    existing_model_paths: List[str]
+) -> BSplineBasis:
+    """
+    Calculates a new BSplineBasis configuration for only the delta terms.
+    """
+    # Step 1: Determine the "delta" interactions
+    # ... (this part is correct and remains unchanged) ...
+    known_interactions = set()
+    for path in existing_model_paths:
+        with open(path, 'r') as f:
+            config_dict = json.load(f)
+        for key in ['knots_map', 'r_min_map', 'r_max_map', 'resolution_map']:
+            if key in config_dict:
+                config_dict[key] = decode_interaction_map(config_dict[key])
+        existing_config = BSplineBasis.from_config(config_dict)
+        known_interactions.update(get_interactions_from_config(existing_config))
+
+    target_interactions = get_interactions_from_config(full_bspline_config)
+    new_interactions = target_interactions - known_interactions
+    
+    print("--- Calculating Delta B-Spline Configuration ---")
+
+    # Step 2: Prepare the filtered settings for the new config
+    delta_interactions_map = {1: full_bspline_config.interactions_map.get(1, [])}
+    for degree in [2, 3]:
+        delta_interactions_map[degree] = [
+            inter for inter in full_bspline_config.interactions_map.get(degree, []) 
+            if inter in new_interactions
+        ]
+        print(f"New {degree}-body terms: {delta_interactions_map[degree]}")
+
+    # Step 3: Create a NEW and CONSISTENT ChemicalSystem for the delta terms
+    delta_chemical_system = composition.ChemicalSystem(
+        element_list=full_bspline_config.element_list,
+        degree=full_bspline_config.degree,
+        interactions_map=delta_interactions_map  # Pass the map directly
+    )
+
+    # Step 4: Filter the other map-like settings
+    delta_r_min_map = {k: v for k, v in full_bspline_config.r_min_map.items() if k in delta_chemical_system.interactions}
+    delta_r_max_map = {k: v for k, v in full_bspline_config.r_max_map.items() if k in delta_chemical_system.interactions}
+    delta_resolution_map = {k: v for k, v in full_bspline_config.resolution_map.items() if k in delta_chemical_system.interactions}
+    
+    # Step 5: Create the final BSplineBasis object from the clean components
+    delta_bspline_config = BSplineBasis(
+        chemical_system=delta_chemical_system,
+        r_min_map=delta_r_min_map,
+        r_max_map=delta_r_max_map,
+        resolution_map=delta_resolution_map,
+        knot_strategy=full_bspline_config.knot_strategy,
+        leading_trim=full_bspline_config.leading_trim,
+        trailing_trim=full_bspline_config.trailing_trim
+    )
+    
+    print("---------------------------------------------")
+    return delta_bspline_config, delta_chemical_system
