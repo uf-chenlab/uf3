@@ -233,7 +233,39 @@ class WeightedLinearModel(BasicLinearModel):
     @staticmethod
     def from_config(config):
         return WeightedLinearModel.from_dict(config)
+    @staticmethod
+    def from_config_with_dict_solutions(config, bspline_config):
+        """
+        Specialized loader that uses a pre-built bspline_config to ensure
+        consistency when loading coefficients from a structured dictionary.
+        """
+        # Create a base model instance using the PROVIDED bspline_config
+        regularizer = config.get("regularizer")
+        data_coverage = config.get("data_coverage")
+        model = WeightedLinearModel(bspline_config,
+                                    regularizer=regularizer,
+                                    data_coverage=data_coverage)
+                                    
+        # Manually build the coefficient vector in the correct order
+        partitions, _ = bspline_config.get_interaction_partitions()
+        coeff_map = config.get("coefficients", {})
+        
+        ordered_coefficients = []
+        for interaction in bspline_config.interactions:
+            if interaction in coeff_map:
+                coeffs = np.array(coeff_map[interaction]).flatten()
+                if len(coeffs) == partitions[interaction]:
+                    ordered_coefficients.append(coeffs)
+                else:
+                    # This error check is what was being triggered
+                    raise ValueError(f"Coefficient size mismatch for {interaction}. "
+                                     f"Expected {partitions[interaction]}, "
+                                     f"found {len(coeffs)}.")
+            else:
+                ordered_coefficients.append(np.zeros(partitions[interaction]))
 
+        model.coefficients = np.concatenate(ordered_coefficients)
+        return model
     @staticmethod
     def from_dict(config, bspline_config=None):
         if bspline_config is None:
