@@ -25,6 +25,7 @@ from multiprocessing import shared_memory
 import scipy.optimize
 import ndsplines
 from queue import Queue
+import json
 import time
 import joblib
 from joblib import Parallel, delayed
@@ -182,7 +183,18 @@ class BasicLinearModel:
             score /= np.std(y)
         return score
 
-
+import re
+def _parse_interaction_key(key_str):
+        # tolerate tuple-like strings, simple separators, or a list
+        if isinstance(key_str, (list, tuple)):
+            symbols = [str(x) for x in key_str]
+        else:
+            s = str(key_str).strip()
+            s = s.strip("()[]")
+            # split on quotes-comma-quotes or any non-letter separator
+            parts = re.split(r"[\"'\s,;-]+", s)
+            symbols = [p for p in parts if p]  # drop empties
+        return composition.sort_interaction_symbols(symbols)
 class WeightedLinearModel(BasicLinearModel):
     """
     Handler class for regularized linear least squares using energies and
@@ -1106,72 +1118,59 @@ class WeightedLinearModel(BasicLinearModel):
         for pair in self.bspline_config.interactions_map[2]:
             results[pair] = self.postshape_repulsion_2b(pair, r_join, delta, **kwargs)
         return results
+    
+
     def configure_combined_model_for_fitting(
-        self,
-        potential_paths: List[str],
-        combined_bspline_config: bspline.BSplineBasis
-    ):
-        """
-        Creates a new model, loads coefficients from existing potentials, and
-        configures the model to freeze those existing coefficients for a new fit.
-
-        Args:
-            potential_paths (List[str]): Paths to existing potential JSON files.
-            combined_bspline_config (bspline.BSplineBasis): The BSpline configuration
-                for the final, combined chemical system.
-
-        Returns:
-            WeightedLinearModel: The new model with pre-trained coefficients loaded
-                and freezing attributes (`col_idx`, `frozen_c`) correctly set.
-        """
+            self,
+            potential_paths: List[str],
+            combined_bspline_config: bspline.BSplineBasis
+        ):
         print("\n--- Configuring a new combined model ---")
-        # 1. Initialize the target model with all coefficients as zero
         combined_model = WeightedLinearModel(bspline_config=combined_bspline_config)
         combined_model.coefficients = np.zeros(combined_model.n_feats)
-        
-        _, combined_offsets = combined_bspline_config.get_interaction_partitions()
-        
-        # 2. Load coefficients and identify which interactions to freeze
+
+        size_map, offset_map = combined_bspline_config.get_interaction_partitions()
+
         print(f"Loading coefficients from {len(potential_paths)} potential file(s)...")
         populated_interactions = set()
         for path in potential_paths:
             try:
-                with open(path, 'r') as f:
+                with open(path, "r") as f:
                     data = json.load(f)
-                source_coeffs_map = data.get('coefficients', {})
+                src = data.get("coefficients", {})
 
-                for key_str, coeffs in source_coeffs_map.items():
-                    key_tuple = tuple(sorted(composition.get_interaction_tuple(key_str)))
-                    if key_tuple in combined_offsets:
-                        offset = combined_offsets[key_tuple]
-                        size = len(np.atleast_1d(coeffs))
-                        combined_model.coefficients[offset : offset + size] = coeffs
+                for key_str, coeffs in src.items():
+                    key_tuple = _parse_interaction_key(key_str)
+                    if key_tuple not in offset_map:
+                        # try again without fixing first element (for 3+ body, depending on how source was written)
+                        key_tuple = composition.sort_interaction_symbols(list(key_tuple), fix_first=False)
+                    if key_tuple in offset_map:
+                        offset = offset_map[key_tuple]
+                        coeffs = np.asarray(coeffs, dtype=float).ravel()
+                        end = offset + len(coeffs)
+                        combined_model.coefficients[offset:end] = coeffs
                         populated_interactions.add(key_tuple)
+                    else:
+                        print(f"  skip unmapped interaction key: {key_str}")
             except Exception as e:
                 print(f"Warning: Could not process {path}. Skipping. Error: {e}")
 
-        # 3. Build the lists of frozen indices and their corresponding values
         print("Setting up freezing for populated coefficients...")
-        frozen_indices = []
-        frozen_values = []
-        
-        for interaction in sorted(list(populated_interactions)):
-            if interaction in combined_offsets:
-                offset = combined_offsets[interaction]
-                size = combined_bspline_config.get_interaction_partitions()[0][interaction]
-                indices = range(offset, offset + size)
-                
-                frozen_indices.extend(indices)
-                frozen_values.extend(combined_model.coefficients[indices])
+        frozen_indices, frozen_values = [], []
+        for interaction in sorted(populated_interactions):
+            if interaction in offset_map:
+                offset = offset_map[interaction]
+                size = size_map[interaction]
+                idx = range(offset, offset + size)
+                frozen_indices.extend(idx)
+                frozen_values.extend(combined_model.coefficients[idx])
 
-        # 4. Set the freezing attributes on the model's configuration
-        combined_model.bspline_config.col_idx = np.array(frozen_indices, dtype=int)
-        combined_model.bspline_config.frozen_c = np.array(frozen_values, dtype=float)
-        
+        combined_model.bspline_config.col_idx = np.asarray(frozen_indices, dtype=int)
+        combined_model.bspline_config.frozen_c = np.asarray(frozen_values, dtype=float)
+
         n_frozen = len(frozen_indices)
         n_total = combined_model.n_feats
         print(f"Configuration complete. {n_frozen}/{n_total} coefficients will be frozen.")
-        
         return combined_model
     def load_and_prepare_data(
         self,
@@ -1212,7 +1211,11 @@ class WeightedLinearModel(BasicLinearModel):
         pbar = tqdm(table_jobs, desc="Scanning") if progress == "bar" else table_jobs
         for job in pbar:
             df = process.load_feature_db(job[0], job[1], subset)  # must close files inside
-            print(f"--- DEBUG loaded df {df.shape}  ")
+            if df is None or df.empty:
+                print(f"--- DEBUG empty df for job {job}  ")
+                continue
+            else:
+                print(f"--- DEBUG loaded df {df.shape}  ")
 
             e_cnt, f_cnt, nf = _count_rows(df, energy_key)
             if nf and n_features == 0:
