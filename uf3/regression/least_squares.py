@@ -40,7 +40,7 @@ def log_total_memory(label=""):
     print(f"[MEMORY] {label} | Total RSS: {mem / 1024 ** 2:.2f} MB")
 def print_mem():
     process = psutil.Process(os.getpid())
-    print(f"RSS Memory: {process.memory_info().rss / 1e6:.2f} MB")
+    #print(f"RSS Memory: {process.memory_info().rss / 1e6:.2f} MB")
 
 class VarianceRecorder:
     """Convenience class for computing online variance and mean"""
@@ -1119,16 +1119,43 @@ class WeightedLinearModel(BasicLinearModel):
             results[pair] = self.postshape_repulsion_2b(pair, r_join, delta, **kwargs)
         return results
     
-
-    def configure_combined_model_for_fitting(
+    def configure_model_by_freezing_elements(
             self,
             potential_paths: List[str],
-            combined_bspline_config: bspline.BSplineBasis
-        ):
+            combined_bspline_config: "bspline.BSplineBasis",
+            frozen_elements: List[str] = None
+    ) -> Tuple["WeightedLinearModel", "bspline.BSplineBasis"]:
+        """
+        Configures a new combined model by loading coefficients from existing
+        potentials and selectively freezing terms based on specified elements.
+
+        Args:
+            potential_paths: List of file paths to the potential files (JSON).
+            combined_bspline_config: The BSpline basis configuration for the new model.
+            frozen_elements: A list of element symbols (e.g., ['N', 'Al']).
+                            If provided, any interaction term composed exclusively
+                            of these elements will be frozen. If None or empty,
+                            no coefficients will be frozen.
+        """
         print("\n--- Configuring a new combined model ---")
+        combined_bspline_config.update_basis_functions()
+
+        if not hasattr(combined_bspline_config, 'symmetry'):
+            combined_bspline_config.symmetry = {}
+
+        for trio in combined_bspline_config.interactions_map.get(3, []):
+            r_min = combined_bspline_config.r_min_map[trio]
+            r_max = combined_bspline_config.r_max_map[trio]
+            res = combined_bspline_config.resolution_map[trio]
+            
+            correct_symmetry = bspline.find_symmetry_3B(trio, r_min, r_max, res)
+            
+            combined_bspline_config.symmetry[trio] = correct_symmetry
+            
         combined_model = WeightedLinearModel(bspline_config=combined_bspline_config)
         combined_model.coefficients = np.zeros(combined_model.n_feats)
-
+        combined_model.coefficients.fill(999)
+        
         size_map, offset_map = combined_bspline_config.get_interaction_partitions()
 
         print(f"Loading coefficients from {len(potential_paths)} potential file(s)...")
@@ -1138,40 +1165,300 @@ class WeightedLinearModel(BasicLinearModel):
                 with open(path, "r") as f:
                     data = json.load(f)
                 src = data.get("coefficients", {})
-
                 for key_str, coeffs in src.items():
                     key_tuple = _parse_interaction_key(key_str)
+                
+                    if len(key_tuple) == 1 and key_tuple[0] in offset_map:
+                        key_tuple = key_tuple[0]
                     if key_tuple not in offset_map:
-                        # try again without fixing first element (for 3+ body, depending on how source was written)
                         key_tuple = composition.sort_interaction_symbols(list(key_tuple), fix_first=False)
+                    print("offset map:")
+                    print(offset_map)
+                    print("key tuple:")
+                    
+                    print(key_tuple)
                     if key_tuple in offset_map:
+                        if len(key_tuple) == 3:
+                            coeffs_vector = combined_bspline_config.compress_3B(
+                                np.array(coeffs), key_tuple, fitting=False
+                            )
+                        else:
+                            coeffs_vector = np.asarray(coeffs, dtype=float).ravel()
+
                         offset = offset_map[key_tuple]
-                        coeffs = np.asarray(coeffs, dtype=float).ravel()
-                        end = offset + len(coeffs)
-                        combined_model.coefficients[offset:end] = coeffs
+                        size = size_map[key_tuple]
+
+                        if len(coeffs_vector) != size:
+                            raise ValueError(
+                                f"Size mismatch for {key_tuple} after processing! "
+                                f"Expected {size}, got {len(coeffs_vector)}. "
+                                "Check bspline symmetry settings."
+                            )
+
+                        end = offset + size
+                        combined_model.coefficients[offset:end] = coeffs_vector
                         populated_interactions.add(key_tuple)
                     else:
                         print(f"  skip unmapped interaction key: {key_str}")
             except Exception as e:
                 print(f"Warning: Could not process {path}. Skipping. Error: {e}")
 
-        print("Setting up freezing for populated coefficients...")
+        print("\n--- Setting up freezing for specified elements ---")
+        
+        frozen_set = set(frozen_elements) if frozen_elements else set()
         frozen_indices, frozen_values = [], []
-        for interaction in sorted(populated_interactions):
-            if interaction in offset_map:
-                offset = offset_map[interaction]
-                size = size_map[interaction]
-                idx = range(offset, offset + size)
-                frozen_indices.extend(idx)
-                frozen_values.extend(combined_model.coefficients[idx])
+
+        if not frozen_set:
+            print("No elements specified in 'frozen_elements'. No coefficients will be frozen.")
+        else:
+            print(f"Will freeze interactions composed exclusively of: {', '.join(sorted(list(frozen_set)))}")
+            for interaction in sorted(list(populated_interactions), key=str):
+                elements = (interaction,) if isinstance(interaction, str) else interaction
+                if set(elements).issubset(frozen_set):
+                    print(f"  -> Freezing coefficients for interaction: {interaction}")
+                    offset = offset_map[interaction]
+                    size = size_map[interaction]
+                    idx = range(offset, offset + size)
+                    frozen_indices.extend(idx)
+                    frozen_values.extend(combined_model.coefficients[idx])
+                else:
+                    print(f"  -> Skipping (not frozen): {interaction}")
 
         combined_model.bspline_config.col_idx = np.asarray(frozen_indices, dtype=int)
         combined_model.bspline_config.frozen_c = np.asarray(frozen_values, dtype=float)
 
         n_frozen = len(frozen_indices)
         n_total = combined_model.n_feats
-        print(f"Configuration complete. {n_frozen}/{n_total} coefficients will be frozen.")
-        return combined_model
+        print(f"\nConfiguration complete. {n_frozen}/{n_total} coefficients will be frozen.")
+        
+        return combined_model, combined_bspline_config
+    
+    def configure_combined_model_for_fitting(
+            self,
+            potential_paths: List[str],
+            combined_bspline_config: bspline.BSplineBasis,
+            frozen_ranges_spec: dict = None 
+    ):
+        print("\n--- Configuring a new combined model: ", frozen_ranges_spec)
+        # The bspline_config passed in might have incorrect or unset symmetry values.
+        combined_bspline_config.update_basis_functions() 
+
+        if not hasattr(combined_bspline_config, 'symmetry'):
+            combined_bspline_config.symmetry = {}
+
+        for trio in combined_bspline_config.interactions_map.get(3, []):
+            r_min = combined_bspline_config.r_min_map[trio]
+            r_max = combined_bspline_config.r_max_map[trio]
+            res = combined_bspline_config.resolution_map[trio]
+            
+            #  symmetry is 1 (A-B-C), 2 (A-A-B), or 3 (A-A-A).
+            correct_symmetry = bspline.find_symmetry_3B(trio, r_min, r_max, res)
+            
+            combined_bspline_config.symmetry[trio] = correct_symmetry
+        combined_model = WeightedLinearModel(bspline_config=combined_bspline_config)
+        combined_model.coefficients = np.zeros(combined_model.n_feats)
+        combined_model.coefficients.fill(999) # Fill with sentinel value
+        
+        # This populates bspline_config.size_map and bspline_config.offset_map
+        size_map, offset_map = combined_bspline_config.get_interaction_partitions()
+
+        print(f"Loading coefficients from {len(potential_paths)} potential file(s)...")
+        populated_interactions = set()
+        for path in potential_paths:
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+                src = data.get("coefficients", {})
+                for key_str, coeffs in src.items():
+                    key_tuple = _parse_interaction_key(key_str)
+                
+                    if len(key_tuple) == 1 and key_tuple[0] in offset_map:
+                        key_tuple = key_tuple[0]
+                    if key_tuple not in offset_map:
+                        key_tuple = composition.sort_interaction_symbols(list(key_tuple), fix_first=False)
+                    print("offset map:")
+                    print(offset_map)
+                    print("key tuple:")
+                    
+                    print(key_tuple)
+
+                    if key_tuple in offset_map:
+                        if len(key_tuple) == 3:
+                            coeffs_vector = combined_bspline_config.compress_3B(
+                                np.array(coeffs),
+                                key_tuple,
+                                fitting=False
+                            )
+                        else:
+                            coeffs_vector = np.asarray(coeffs, dtype=float).ravel()
+
+                        offset = offset_map[key_tuple]
+                        size = size_map[key_tuple]
+
+                        if len(coeffs_vector) != size:
+                            raise ValueError(
+                                f"Size mismatch for {key_tuple} after processing! "
+                                f"Expected {size}, got {len(coeffs_vector)}. "
+                                "Check bspline symmetry settings."
+                            )
+
+                        end = offset + size
+                        # Load coefficients from old model
+                        combined_model.coefficients[offset:end] = coeffs_vector 
+                        populated_interactions.add(key_tuple)
+                        # after freezing the requested pair/triple indices for key_tuple
+                        for el in key_tuple:
+                            one = (el,)
+                            if one in offset_map:
+                                o = offset_map[one]; s = size_map[one]
+                                frozen_idx_global.extend(range(o, o+s))
+
+                    else:
+                        print(f"  skip unmapped interaction key: {key_str}")
+                    
+            except Exception as e:
+                print(f"Warning: Could not process {path}. Skipping. Error: {e}")
+
+            # --- FREEZING SECTION (2B + 1B) ---
+            print("Setting up freezing for coefficients...")
+            frozen_idx_global = []
+
+            def _as_tuple(x):
+                return x if isinstance(x, tuple) else (x,)
+
+            def _full_block_indices(key):
+                o = offset_map[key]; s = size_map[key]
+                return np.arange(o, o + s, dtype=int)
+
+            def _freeze_add(indices, tag):
+                if indices.size:
+                    frozen_idx_global.extend(indices.tolist())
+                    print(f"  [{tag}] add={indices.size} span=[{indices.min()}:{indices.max()}]")
+                else:
+                    print(f"  [{tag}] add=0")
+
+            # ---- selective 2B range freezing ----
+            if frozen_ranges_spec:
+                print(f"Applying selective freezing for {len(frozen_ranges_spec)} interactions.")
+                for key_str, ranges in frozen_ranges_spec.items():
+                    key_tuple = _parse_interaction_key(key_str)
+                    try:
+                        key_tuple = tuple(key_tuple)
+                    except TypeError:
+                        key_tuple = (key_tuple,)
+                    if key_tuple not in offset_map:
+                        key_tuple = tuple(composition.sort_interaction_symbols(list(key_tuple), fix_first=False))
+                    if key_tuple not in offset_map:
+                        print(f"  [skip-freeze] {key_str} -> {key_tuple} not in model")
+                        continue
+                    if not (isinstance(key_tuple, tuple) and len(key_tuple) == 2):
+                        print(f"  [skip-non-2B] {key_tuple}")
+                        continue
+
+                    o = offset_map[key_tuple]
+                    s = size_map[key_tuple]
+                    r_min = combined_bspline_config.r_min_map[key_tuple]
+                    r_max = combined_bspline_config.r_max_map[key_tuple]
+                    print(f"  [target] key={key_tuple} offset={o} size={s} domain=[{r_min},{r_max}] ranges={ranges}")
+
+                    valid = []
+                    for r in ranges:
+                        if not (isinstance(r, (list, tuple)) and len(r) == 2):
+                            print(f"    [bad-range] {r} (ignored)")
+                            continue
+                        a, b = float(r[0]), float(r[1])
+                        if b < a: a, b = b, a
+                        valid.append((a, b))
+                    if not valid:
+                        print(f"    [no-valid-ranges] key={key_tuple}")
+                        continue
+
+                    user_min = min(a for a, _ in valid)
+                    user_max = max(b for _, b in valid)
+                    seg_dx = (r_max - r_min) / max(s, 1)
+                    tol = max(1e-8, 0.5 * seg_dx)
+                    expect_full = (user_min <= r_min + tol) and (user_max >= r_max - tol)
+                    print(f"    [coverage] user=[{user_min},{user_max}] tol={tol} expect_full={expect_full}")
+
+                    try:
+                        idx = combined_bspline_config.get_indices_for_distance_ranges(
+                            key_tuple, valid, degree=3
+                        )
+                    except Exception as e:
+                        print(f"    [range-index-error] key={key_tuple} err={e}")
+                        idx = None
+
+                    idx = np.asarray([] if idx is None else idx, dtype=int).ravel()
+
+                    in_block = (idx >= o) & (idx < o + s)
+                    looks_global = idx.size > 0 and in_block.all()
+                    looks_local = idx.size > 0 and idx.min() >= 0 and idx.max() < s
+
+                    if looks_global and not looks_local:
+                        g = np.unique(idx.astype(int)); coord = "global"
+                    elif looks_local:
+                        g = np.unique((idx + o).astype(int)); coord = "local"
+                    else:
+                        g = np.unique(idx[(idx >= o) & (idx < o + s)].astype(int)); coord = "mixed"
+
+                    print(f"    [indices] coord={coord} count={g.size} "
+                        f"min={g.min() if g.size else 'NA'} max={g.max() if g.size else 'NA'}")
+
+                    if expect_full:
+                        block = _full_block_indices(key_tuple)
+                        if g.size != block.size or np.any(g != block):
+                            print(f"    [full-range-mismatch] want={block.size} got={g.size}")
+                            g = block
+                        _freeze_add(g, "freeze-2B-full")
+                    else:
+                        if g.size == 0:
+                            print("    [warn] partial-range produced 0 bins after clamp")
+                        _freeze_add(g, "freeze-2B-partial")
+            else:
+                print("No range spec. Freezing all populated 2B interactions.")
+                for inter in sorted(populated_interactions, key=_as_tuple):
+                    if isinstance(inter, tuple) and len(inter) == 2:
+                        _freeze_add(_full_block_indices(inter), "freeze-2B-all")
+
+            # ---- freeze all 1B terms unconditionally ----
+            print("Freezing all 1-body terms...")
+            for inter in sorted(populated_interactions, key=_as_tuple):
+                if isinstance(inter, str) or (isinstance(inter, tuple) and len(inter) == 1):
+                    sym = inter if isinstance(inter, str) else inter[0]
+                    if sym in offset_map:
+                        o = offset_map[sym]; s = size_map[sym]
+                        frozen_idx_global.extend(range(o, o + s))
+                        print(f"  [freeze-1B] {sym} span=[{o}:{o+s}]")
+
+            # ---- finalize frozen indices ----
+            frozen_idx_global = np.unique(np.asarray(frozen_idx_global, dtype=int))
+            print(f"[frozen-stats] count={frozen_idx_global.size} "
+                f"min={frozen_idx_global.min() if frozen_idx_global.size else 'NA'} "
+                f"max={frozen_idx_global.max() if frozen_idx_global.size else 'NA'}")
+
+            if frozen_idx_global.size:
+                sent_mask = combined_model.coefficients[frozen_idx_global] == 999
+                n_bad = int(np.sum(sent_mask))
+                if n_bad:
+                    sample = frozen_idx_global[sent_mask][:10]
+                    print(f"[error] {n_bad} frozen coeffs still sentinel; sample idx={sample}")
+                    raise RuntimeError("Frozen coefficients include uninitialized values (sentinel=999).")
+
+            frozen_vals = combined_model.coefficients[frozen_idx_global].astype(float, copy=True)
+            combined_model.bspline_config.col_idx = frozen_idx_global
+            combined_model.bspline_config.frozen_c = frozen_vals
+
+            n_frozen = frozen_idx_global.size
+            n_total = combined_model.n_feats
+            n_trainable = n_total - n_frozen
+            print(f"Configuration complete. frozen={n_frozen}, trainable={n_trainable}, total={n_total}.")
+
+
+
+        return combined_model, combined_bspline_config
+# --- END FREEZING SECTION ---
+
+
     def load_and_prepare_data(
         self,
         filenames: List[str],
@@ -1185,38 +1472,75 @@ class WeightedLinearModel(BasicLinearModel):
         memmap_dir: Optional[str] = '/blue/ypchen/ntaormina/uf3/AlN/test_auto/UF3-Tools/algan/memmap',
         max_in_flight: Optional[int] = None,
     ) -> Dict[str, np.ndarray]:
+        import glob
+        import h5py
+        import gc
+        import warnings
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from tqdm import tqdm
+
         if num_cores == -1:
             num_cores = os.cpu_count() or 1
         if max_in_flight is None:
-            max_in_flight = min(4, max(1, num_cores))  # keep tiny inside Dask workers
+            max_in_flight = min(4, max(1, num_cores))
 
-        # discover tables
+        # --- discover tables ---
+        paths = []
+        for f in filenames:
+            if any(ch in f for ch in "*?[]"):
+                paths.extend(glob.glob(f))
+            elif os.path.isdir(f):
+                for root, _, files in os.walk(f):
+                    for x in files:
+                        if x.endswith((".h5", ".hdf5")):
+                            paths.append(os.path.join(root, x))
+            else:
+                paths.append(f)
+
         table_jobs = []
-        for fname in filenames:
-            if not os.path.isfile(fname): 
+        for fname in paths:
+            if not os.path.isfile(fname):
                 warnings.warn(f"File not found, skipping: {fname}")
                 continue
             try:
-                # Assuming io is imported from uf3.data
                 _, _, table_names, _ = io.analyze_hdf_tables(fname)
-                table_jobs.extend([(fname, tname) for tname in table_names])
+                if not table_names:
+                    # fallback for pandas HDFStore
+                    try:
+                        import pandas as pd
+                        with pd.HDFStore(fname, mode="r") as store:
+                            table_names = store.keys()
+                    except Exception:
+                        pass
+                if not table_names:
+                    warnings.warn(f"No HDF5 tables reported in {fname}")
+                else:
+                    print(f"[discover] {fname} -> {len(table_names)} tables: {table_names}")
+                    table_jobs.extend([(fname, t) for t in table_names])
             except Exception as e:
                 warnings.warn(f"Could not analyze HDF5 file {fname}: {e}")
-        if not table_jobs:
-            raise ValueError("No tables found.")
+                # fallback: list raw datasets
+                try:
+                    with h5py.File(fname, "r") as h5:
+                        def walk(name, obj):
+                            if isinstance(obj, h5py.Dataset):
+                                table_jobs.append((fname, name))
+                        h5.visititems(walk)
+                except Exception:
+                    pass
 
-        # pass 1: counts per job
-        job_meta = []  # (job, e_cnt, f_cnt)
+        if not table_jobs:
+            raise ValueError(f"No tables found. Checked {len(paths)} path(s). "
+                            "Files either missing, not HDF5, or contain no recognized tables.")
+
+        # --- pass 1: count rows/features ---
+        job_meta = []
         n_features = 0
         pbar = tqdm(table_jobs, desc="Scanning") if progress == "bar" else table_jobs
         for job in pbar:
-            df = process.load_feature_db(job[0], job[1], subset)  # must close files inside
+            df = process.load_feature_db(job[0], job[1], subset)
             if df is None or df.empty:
-                print(f"--- DEBUG empty df for job {job}  ")
                 continue
-            else:
-                print(f"--- DEBUG loaded df {df.shape}  ")
-
             e_cnt, f_cnt, nf = _count_rows(df, energy_key)
             if nf and n_features == 0:
                 n_features = nf
@@ -1225,9 +1549,9 @@ class WeightedLinearModel(BasicLinearModel):
             if len(job_meta) % 8 == 0:
                 gc.collect()
         if n_features == 0:
-            raise ValueError("No features detected.")
+            raise ValueError("No features detected in discovered tables.")
 
-        # offsets
+        # --- offsets ---
         e_offsets, f_offsets = {}, {}
         e_total = f_total = 0
         for job, e_cnt, f_cnt in job_meta:
@@ -1236,7 +1560,7 @@ class WeightedLinearModel(BasicLinearModel):
             e_total += e_cnt
             f_total += f_cnt
 
-        # allocate finals
+        # --- allocate arrays ---
         def _alloc(path, shape, dt):
             if use_memmap:
                 if not memmap_dir:
@@ -1252,7 +1576,7 @@ class WeightedLinearModel(BasicLinearModel):
 
         n_elements = len(self.bspline_config.element_list)
 
-        # pass 2: bounded in-flight, fill by offsets
+        # --- pass 2: fill arrays ---
         def _load(job):
             df = process.load_feature_db(job[0], job[1], subset)
             return job, df
@@ -1277,20 +1601,17 @@ class WeightedLinearModel(BasicLinearModel):
                     job, df_chunk = fut.result()
 
                     if df_chunk is not None and not df_chunk.empty:
-                        # ensure dataframe_to_tuples returns arrays already in 'dtype'
                         x_e, y_e, x_f, y_f = dataframe_to_tuples(
                             df_chunk, n_elements, energy_key, sample_weights
                         )
                         e_off = e_offsets[job]; f_off = f_offsets[job]
                         e_len = len(y_e); f_len = len(y_f)
-
                         if e_len:
                             np.copyto(x_e_final[e_off:e_off+e_len, :], x_e, casting='no')
                             np.copyto(y_e_final[e_off:e_off+e_len], y_e, casting='no')
                         if f_len:
                             np.copyto(x_f_final[f_off:f_off+f_len, :], x_f, casting='no')
                             np.copyto(y_f_final[f_off:f_off+f_len], y_f, casting='no')
-
                         del df_chunk, x_e, y_e, x_f, y_f
 
                     processed += 1
@@ -1309,6 +1630,7 @@ class WeightedLinearModel(BasicLinearModel):
 
         gc.collect()
         return {"x_e": x_e_final, "y_e": y_e_final, "x_f": x_f_final, "y_f": y_f_final}
+
 
 
     
@@ -1448,7 +1770,7 @@ class WeightedLinearModel(BasicLinearModel):
             df = self.drop_excluded_columns(exclude_elements, df)
         gram_e, gram_f, ord_e, ord_f = self.initialize_gram_ordinate()
         e_var, f_var = VarianceRecorder(), VarianceRecorder()
-        if(num_cores > 4):
+        if(num_cores > 6):
             os.environ["MKL_NUM_THREADS"] = "6"
             os.environ["OMP_NUM_THREADS"] = "6"
             num_cores = num_cores//6
@@ -1816,6 +2138,7 @@ class WeightedLinearModel(BasicLinearModel):
 
     def to_json(self, filename: str):
         """Save model (coefficients and knots map) to json file."""
+
         json_io.dump_interaction_map(self.as_dict(),
                                      filename=filename,
                                      write=True)
@@ -1910,6 +2233,8 @@ class WeightedLinearModel(BasicLinearModel):
             interactions = self.bspline_config.interactions_map[degree]
             for interaction in interactions:
                 values = solution[interaction]
+                print("interaction: ", interaction)
+                print("values: ", values)
                 flattened_coefficients.append(values)
         # self-energies, pair interactions & trio interactions
         n_interactions = len(self.bspline_config.partition_sizes)
@@ -1927,6 +2252,8 @@ class WeightedLinearModel(BasicLinearModel):
                                            n_coefficients)
             raise ValueError(error_line)
         self.coefficients = np.array(flattened_coefficients)
+        np.savetxt("coefficients_early.csv", self.coefficients, delimiter=",")
+
 
     def fix_repulsion_2b(self, pair, r_target=None, min_curvature=2.0):
         components = self.bspline_config.get_interaction_partitions()
@@ -2318,8 +2645,8 @@ def batched_moore_penrose(x, y, batch_size=500):
 
     gram = np.zeros((n_features, n_features), dtype=np.float64)
     ordinate = np.zeros(n_features, dtype=np.float64)
-    print("moore penrose setup")
-    print_mem()
+    #print("moore penrose setup")
+    #print_mem()
     t0 = time.perf_counter()
     loop_count = 0
     for start in range(0, n_samples, batch_size):
@@ -2332,14 +2659,14 @@ def batched_moore_penrose(x, y, batch_size=500):
         np.add(gram, g, out=gram)
         np.add(ordinate, o, out=ordinate)
         t2 = time.perf_counter()
-        print(f"Batch {loop_count} | samples {start}:{stop} | time: {t2 - t1:.4f}s")
+        #print(f"Batch {loop_count} | samples {start}:{stop} | time: {t2 - t1:.4f}s")
         del x_batch, y_batch, g, o
         loop_count += 1
         
         if (loop_count) % 4 == 0:
             gc.collect()
     t3 = time.perf_counter()
-    print(f"Complete moore penrose {loop_count} | time: {t3 - t0:.4f}s")
+    #print(f"Complete moore penrose {loop_count} | time: {t3 - t0:.4f}s")
     return gram, ordinate
 
 
@@ -3143,7 +3470,7 @@ def _process_chunk_shared(shm_metas, e_indices, f_indices, batch_size,
 
         # Connect to x_e and get the specific slice for this worker
         shm_x_e = shared_memory.SharedMemory(name=shm_metas['x_e']['name'])
-        print("name: ", shm_metas['x_e']['name'])
+        #print("name: ", shm_metas['x_e']['name'])
         shms_to_close.append(shm_x_e)
         full_x_e = np.ndarray(shm_metas['x_e']['shape'], dtype=shm_metas['x_e']['dtype'], buffer=shm_x_e.buf)
         x_e = full_x_e[e_indices]

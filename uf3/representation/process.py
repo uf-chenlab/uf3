@@ -616,7 +616,7 @@ def print_mem():
 
 def load_feature_db(filename, table_name=None, keys=None):
     dataframe = pd.read_hdf(filename, table_name)
-    print_mem()
+    #print_mem()
     if keys is not None:
         table_keys = dataframe.index.unique(level=0)
         matching_keys = table_keys.intersection(keys)
@@ -760,6 +760,22 @@ def get_delta_bspline_config(
             if inter in new_interactions
         ]
         print(f"New {degree}-body terms: {delta_interactions_map[degree]}")
+    for k, v in delta_interactions_map.items():
+        fixed = []
+        for item in v:
+            if isinstance(item, str):
+                fixed.append((item,))
+            elif isinstance(item, tuple):
+                fixed.append(item)
+            elif isinstance(item, list):
+                fixed.append(tuple(item))
+            else:
+                raise ValueError(f"Unexpected type in interactions_map[{k}]: {item}")
+        delta_interactions_map[k] = fixed
+    for degree, inters in delta_interactions_map.items():
+        print(f"{degree}-body:")
+        for i, item in enumerate(inters):
+            print(f"  {i}: {item} ({type(item)})")
 
     # Step 3: Create a NEW and CONSISTENT ChemicalSystem for the delta terms
     delta_chemical_system = composition.ChemicalSystem(

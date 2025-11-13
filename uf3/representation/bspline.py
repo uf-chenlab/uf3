@@ -551,22 +551,30 @@ class BSplineBasis:
 
     def get_interaction_partitions(self, uncompressed=False):
         """
-
+        Get and store partition sizes and offsets for each interaction.
 
         Returns:
-
+            Tuple[dict, dict]: (size_map, offset_map)
         """
         interactions_list = self.interactions
-        partition_sizes = self.get_feature_partition_sizes(uncompressed=uncompressed)
+        partition_sizes = self.get_feature_partition_sizes(
+            uncompressed=uncompressed
+        )
         offsets = np.cumsum(partition_sizes)
         offsets = np.insert(offsets, 0, 0)
-        component_sizes = {}
-        component_offsets = {}
+        
+        # Initialize (or clear) instance attributes
+        self.size_map = {}
+        self.offset_map = {}
+        
         for j in range(len(interactions_list)):
             interaction = interactions_list[j]
-            component_sizes[interaction] = partition_sizes[j]
-            component_offsets[interaction] = offsets[j]
-        return component_sizes, component_offsets
+            # Populate the instance attributes
+            self.size_map[interaction] = partition_sizes[j]
+            self.offset_map[interaction] = offsets[j]
+            
+        # Return them to maintain original function behavior
+        return self.size_map, self.offset_map
 
     def get_column_names(self):
         composition_columns = ['n_{}'.format(el) for el
@@ -696,6 +704,73 @@ class BSplineBasis:
         vec = vec.flat[self.template_mask[interaction]]
         vec = vec * redundancy
         return vec
+    def get_indices_for_distance_ranges(self, 
+                                        interaction_key: tuple, 
+                                        distance_ranges: list, 
+                                        degree: int = 3):
+        """
+        Gets the global coefficient indices for a 2-body interaction that
+        fall within any of the specified distance ranges.
+
+        Args:
+            interaction_key (tuple): The interaction, e.g., ('Al', 'N').
+            distance_ranges (list): List of [min, max] ranges, e.g., [[0, 1.5], [2.5, 5.0]].
+            degree (int): The spline degree (default is 3 for cubic).
+        
+        Returns:
+            list: A list of global coefficient indices to be frozen.
+        """
+        # Freezing by range is complex for 3-body, only supporting 2-body for now.
+        if len(interaction_key) != 2:
+            print(f"Warning: Freezing by range is only supported for 2-body interactions. "
+                  f"Skipping {interaction_key}.")
+            return []
+
+        # Ensure offset and size maps are populated
+        if not hasattr(self, 'offset_map') or not self.offset_map:
+             self.get_interaction_partitions()
+
+        if interaction_key not in self.offset_map:
+            # Try sorted version
+            sorted_key = tuple(sorted(interaction_key))
+            if sorted_key in self.offset_map:
+                interaction_key = sorted_key
+            else:
+                print(f"Warning: Interaction {interaction_key} not in BSpline offset map. "
+                      f"Cannot freeze ranges. Skipping.")
+                return []
+
+        offset = self.offset_map[interaction_key]
+        size = self.size_map[interaction_key]
+        knots = self.knots_map[interaction_key]
+        k = degree
+
+        global_indices_to_freeze = []
+        for j in range(size):
+            # The j-th basis function (local index) has a support
+            # (non-zero range) defined by its corresponding knots [t_j, t_{j+k+1}]
+            try:
+                t_min = knots[j]
+                t_max = knots[j + k + 1]
+            except IndexError:
+                print(f"Warning: Knot index out of bounds for {interaction_key} at index {j}. Skipping.")
+                continue
+
+            support_range = (t_min, t_max)
+
+            # Check if this basis function's support overlaps with any frozen range
+            is_frozen = False
+            for frozen_range in distance_ranges:
+                # Overlap check for [a, b] vs [c, d]: a < d AND c < b
+                if support_range[0] < frozen_range[1] and frozen_range[0] < support_range[1]:
+                    is_frozen = True
+                    break  # Found an overlap, no need to check other ranges
+            
+            if is_frozen:
+                # Convert local index 'j' to global coefficient index
+                global_indices_to_freeze.append(offset + j)
+                
+        return global_indices_to_freeze
 
 
     def decompress_3B(self, vec, interaction):
